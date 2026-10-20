@@ -10,10 +10,10 @@ Professional 24/7 broadcast playout for Windows. Build a playlist of videos and 
 - **Live playlist editing** — add, drag, duplicate, copy/paste, loop and cue items while on air without touching what is playing
 - **Event rows** — STOP events to hold the channel, notes for the operator, and OBS events to switch scenes or show/hide sources
 - **Full-screen output** on any connected display, with a selectable audio output device, plus a browser player for OBS or other computers on your network
-- **Live controls** — output volume and timeline scrubbing behind an edit-mode safety lock
+- **Live controls** — a vertical audio strip next to the On Air Preview: the output volume fader, always live, and a level meter of what goes to air. Only timeline scrubbing sits behind the **EDIT** safety lock
 - **File checks** — missing or corrupt files are marked red and skipped before they go on air
 - **Plays almost any video** — AVI, MKV, TS, HEVC and other formats the player cannot open are converted to MP4 in the background, using the GPU when there is one
-- **Session recovery** — after a crash or power cut FlowAir offers to restore the last playlist
+- **Session recovery** — after a crash, a power cut or an unexpected restart of the playout engine, FlowAir offers to restore the last playlist
 - **Built for the keyboard** — the playout shortcuts can be reassigned in Settings, and every confirmation is driven with `Enter` and `Esc`
 - **In-app updates** — FlowAir tells you when a new version exists and downloads the installer for you
 
@@ -30,7 +30,7 @@ Besides copying the program, the installer:
 
 - adds one inbound firewall rule, *FlowAir Engine*, so players on other computers can reach the stream — the stream itself stays closed until you turn on Network Streaming
 - registers the `.flowair` extension, so a saved playlist opens in FlowAir when you double-click it
-- registers FlowAir in *Apps & features* with its version, publisher, icon, size, install date and a link to this project, and in *Default apps*
+- registers FlowAir in *Apps & features* with its version, publisher, icon, size, install date and a link to the [TridentSky software page](https://tridentsky.net/software), and in *Default apps*
 
 > **Note:** If Windows blocks the installer completely (Smart App Control), open **Windows Security > App & browser control > Smart App Control** and set it to **Off**.
 
@@ -72,7 +72,7 @@ FlowAir checks for new releases and shows a discreet **Update** control in the h
 
 Installing an update is exactly the *Installing over an existing FlowAir* flow above, so your settings, shortcuts, OBS credentials and the recovered session survive it. If you prefer to update by hand, download **FlowAir-Setup.exe** from the Releases page and run it.
 
-Update checks can be turned off completely in **Settings**, and dismissing a version means FlowAir never mentions it again. On a machine with no internet access the check fails silently.
+The update panel says when FlowAir last checked, and **Check now** looks for a new version right away. Update checks can be turned off completely in the same panel, and dismissing a version means FlowAir never mentions it again. On a machine with no internet access the check fails silently.
 
 ## Using FlowAir
 
@@ -82,11 +82,13 @@ Update checks can be turned off completely in **Settings**, and dismissing a ver
 | Duplicate an item | Hold `Ctrl` and drag the row, or right-click > **Duplicate** |
 | Go on air | **PLAY** (`Space`) |
 | Jump to an item | Select it and press **NEXT** (`N`), or **CUE** it (`Enter`) and press Play |
+| Seek inside the clip on air | Turn on **EDIT** next to the remaining time, then drag or click the progress bar. The next start times move with it |
 | Hold the channel | Right-click the playlist > **Insert STOP Event** |
 | Operator notes | Right-click > **Insert Note** (double-click a note to edit it) |
 | OBS automation | Connect in **Settings > OBS**, then right-click > **Insert OBS Event** |
 | Full-screen output | **Settings > Output**, choose a display and apply |
 | Audio output device | **Settings > Output**, choose a sound device for the full-screen output |
+| Output volume | Drag the fader in the audio strip next to the On Air Preview up or down. It never jumps to where you click; hold `Shift` for fine steps |
 | Player for OBS | Add a Browser Source with `http://localhost:8000/player` |
 | Player on other computers | **Settings > Network > Enable Network Streaming** |
 | Save or load a playlist | **Save** / **Load**, drop a `.flowair` file on the playlist, or double-click it in Explorer |
@@ -157,13 +159,13 @@ For unattended 24/7 playout, MP4 with H.264 and AAC is still the best profile: i
 - **"FlowAir is already running."** — another Windows user session on this computer owns the playout engine. Sign that session out, or use the same account.
 - **"The FlowAir playout engine stopped several times..."** — close FlowAir, open it again, and reinstall if it keeps happening.
 - **A row stays on Preparing or turns red after converting** — hover it to read the reason and see *Video compatibility* above. Right-click > **Convert** tries again.
-- **The full-screen output closed by itself** — its display was disconnected. Reconnect it and apply the Output settings again.
+- **The full-screen output closed by itself** — its display was disconnected. Reconnect it: FlowAir reopens the output on that display a couple of seconds later. Apply the Output settings again only if it does not come back. An output window closed from the keyboard (for example `Alt+F4`) reopens with `Ctrl+Shift+E`.
 - **A network player shows "Access denied"** — turn on *Network Streaming* in **Settings > Network** on the FlowAir computer. Only the player is shared; the playlist can only be controlled from the FlowAir computer.
 - **A network player never connects** — the *FlowAir Engine* firewall rule is missing or was blocked by policy. Re-run the installer, or add an inbound rule for `resources\backend\flowair-backend.exe`.
 
 ## Build from source
 
-You need [Node.js](https://nodejs.org) 18 or newer, [Python](https://www.python.org) 3.11 or newer, and `ffprobe.exe` plus `ffmpeg.exe` from the [gyan.dev FFmpeg 8.0.1 essentials build](https://www.gyan.dev/ffmpeg/builds/) placed in `ffmpeg/bin/`. If you use a different build, update `build/ffmpeg-license.txt` to match it. Both are shipped with the installer: `ffprobe.exe` checks media and `ffmpeg.exe` converts it.
+You need [Node.js](https://nodejs.org) 22.12 or newer, [Python](https://www.python.org) 3.11 to 3.14, and `ffprobe.exe` plus `ffmpeg.exe` from the [gyan.dev FFmpeg 8.0.1 essentials build](https://www.gyan.dev/ffmpeg/builds/) placed in `ffmpeg/bin/`. If you use a different build, update `build/ffmpeg-license.txt` to match it. Both are shipped with the installer: `ffprobe.exe` checks media and `ffmpeg.exe` converts it.
 
 Run in development mode (installs dependencies on first run):
 
@@ -179,7 +181,7 @@ npm install
 npm run dist
 ```
 
-Port 8000 must be free while building: the packaged engine is started and checked before the installer is created, including a real conversion of a generated AVI clip. The build also refuses to continue if `ffprobe.exe` or `ffmpeg.exe` is missing, if an installer resource or the FFmpeg licence notice is missing from `build/`, or if the packaged application does not contain the app, the engine, `ffprobe.exe`, `ffmpeg.exe` and the FFmpeg licence. The installer is written to `Installer/FlowAir-Setup.exe`.
+Port 8000 must be free while building: the packaged engine is started and checked before the installer is created, including a real conversion of a generated AVI clip. The build also refuses to continue if `ffprobe.exe` or `ffmpeg.exe` is missing, if an installer resource or the FFmpeg licence notice is missing from `build/`, if that notice does not name the version `ffprobe.exe` and `ffmpeg.exe` report, or if the packaged application does not contain the app, the engine, `ffprobe.exe`, `ffmpeg.exe` and the FFmpeg licence. The installer is written to `Installer/FlowAir-Setup.exe`.
 
 ### Project structure
 

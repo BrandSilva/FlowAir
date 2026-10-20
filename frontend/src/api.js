@@ -73,6 +73,7 @@ export const api = {
     item_id: itemId
   }),
   seekPlayer: (position, itemId) => post('/player/seek', { position, item_id: itemId }),
+  getPlayerState: () => get('/player/state'),
   setPlayerVolume: (volume) => post('/player/volume', { volume }),
   getOBSCurrentScene: () => get('/obs/current_scene'),
   setOBSScene: (sceneName) => post('/obs/set_scene', { scene_name: sceneName }),

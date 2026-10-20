@@ -1,14 +1,16 @@
 import React, { useState, useEffect } from 'react'
+import AudioStrip from './AudioStrip'
 
 const AUDIO_THROTTLE_MS = 120
 const AUDIO_STEP = 4
 const OUTPUT_AUDIO_TIMEOUT_MS = 2000
 const OUTPUT_AUDIO_CHECK_MS = 500
+const ACTIVE_CONVERSION = ['queued', 'running']
 
-const getVuColor = (level) => {
-  if (level < 60) return 'var(--success)'
-  if (level < 80) return 'var(--warning)'
-  return 'var(--danger)'
+const isPreparing = (item) => {
+  const conversion = item.conversion
+  return item.playability === 'preparing' ||
+    !!(conversion && typeof conversion === 'object' && ACTIVE_CONVERSION.includes(conversion.status))
 }
 
 const getBitrateTag = (bitrate) => {
@@ -42,6 +44,9 @@ const getStatus = (item) => {
   if (item.status === 'validating') {
     return { text: 'VALIDATING', color: 'var(--accent)', title: '' }
   }
+  if (isPreparing(item)) {
+    return { text: 'PREPARING • skipped on air until ready', color: 'var(--accent)', title: title }
+  }
   if (item.playability === 'unsupported') {
     return { text: reason ? `UNSUPPORTED • ${reason}` : 'UNSUPPORTED', color: 'var(--danger)', title: title }
   }
@@ -51,7 +56,7 @@ const getStatus = (item) => {
   return { text: 'OK', color: 'var(--success)', title: '' }
 }
 
-const Preview = ({ currentItem, isPlaying, decoding = true, lowPower = false, countdown = '', onResumePreview, audioLevelSource = null }) => {
+const Preview = ({ currentItem, isPlaying, decoding = true, lowPower = false, countdown = '', onResumePreview, audioLevelSource = null, volume = 100, onVolumeChange }) => {
   const [audioLevel, setAudioLevel] = useState(0)
   const [outputAudioLive, setOutputAudioLive] = useState(false)
 
@@ -121,93 +126,79 @@ const Preview = ({ currentItem, isPlaying, decoding = true, lowPower = false, co
           </span>
         </div>
 
-        <div style={styles.videoArea}>
-          {decoding ? (
-            <iframe
-              src="http://localhost:8000/player?muted=1"
-              style={styles.iframe}
-              title="Player Preview"
-              allow="autoplay"
-            />
-          ) : (
-            <div style={styles.pausedPanel}>
-              <span style={styles.pausedBadge}>PREVIEW PAUSED - OUTPUT IS LIVE</span>
-              <span style={styles.pausedName} title={currentItem ? currentItem.name : ''}>
-                {currentItem ? currentItem.name : 'Nothing on air'}
-              </span>
-              <span style={styles.pausedCountdown}>{countdown || '--:--'}</span>
-              <span style={styles.pausedNote}>
-                This PC decodes the picture once, on the output screen. Decoding it here as well is what makes playback stutter.
-              </span>
-              <button style={styles.pausedButton} onClick={onResumePreview}>
-                Show the preview anyway
-              </button>
-            </div>
-          )}
-        </div>
-
-        <div style={styles.infoSection}>
-          <div style={styles.infoRow}>
-            <span style={styles.label}>File</span>
-            <span style={styles.value} title={currentItem ? currentItem.name : ''}>
-              {currentItem ? currentItem.name : '-'}
-            </span>
-          </div>
-          <div style={styles.infoRow}>
-            <span style={styles.label}>Duration</span>
-            <span style={styles.valueNum}>
-              {currentItem ? (currentItem.duration_formatted || currentItem.duration || '-') : '-'}
-            </span>
-          </div>
-          <div style={styles.infoRow}>
-            <span style={styles.label}>Size</span>
-            <span style={styles.valueNum}>
-              {currentItem && currentItem.file_size ? (
-                <>
-                  {currentItem.file_size}
-                  {currentItem.bitrate && ` • ${currentItem.bitrate}`}
-                  {bitrateTag && <span style={{ color: bitrateTag.color, fontWeight: '600' }}>{bitrateTag.label}</span>}
-                </>
-              ) : '-'}
-            </span>
-          </div>
-          <div style={styles.infoRow}>
-            <span style={styles.label}>Format</span>
-            <span style={styles.value}>{currentItem && currentItem.format ? currentItem.format : '-'}</span>
-          </div>
-          <div style={styles.infoRow}>
-            <span style={styles.label}>Status</span>
-            <span style={{ ...styles.value, color: status.color, fontWeight: '600' }} title={status.title}>
-              {status.text}
-            </span>
-          </div>
-          <div style={styles.audioRow}>
-            <span style={styles.label}>Audio</span>
-            {meterAvailable ? (
-              <>
-                <div style={styles.vuMeterContainer}>
-                  <div style={{
-                    height: '100%',
-                    borderRadius: '999px',
-                    transition: 'width 0.08s linear, background 0.12s ease',
-                    width: `${hasAudio ? audioLevel : 0}%`,
-                    background: getVuColor(audioLevel)
-                  }} />
+        <div style={styles.body}>
+          <div style={styles.mainColumn}>
+            <div style={styles.videoArea}>
+              {decoding ? (
+                <iframe
+                  src="http://localhost:8000/player?muted=1"
+                  style={styles.iframe}
+                  title="Player Preview"
+                  allow="autoplay"
+                  tabIndex={-1}
+                />
+              ) : (
+                <div style={styles.pausedPanel}>
+                  <span style={styles.pausedBadge}>PREVIEW PAUSED - OUTPUT IS LIVE</span>
+                  <span style={styles.pausedName} title={currentItem ? currentItem.name : ''}>
+                    {currentItem ? currentItem.name : 'Nothing on air'}
+                  </span>
+                  <span style={styles.pausedCountdown}>{countdown || '--:--'}</span>
+                  <span style={styles.pausedNote}>
+                    This PC decodes the picture once, on the output screen. Decoding it here as well is what makes playback stutter.
+                  </span>
+                  <button style={styles.pausedButton} onClick={onResumePreview}>
+                    Show the preview anyway
+                  </button>
                 </div>
-                <span style={styles.vuLevel}>{hasAudio ? `${audioLevel}%` : '--%'}</span>
-              </>
-            ) : (
-              <>
-                <span
-                  style={styles.vuUnavailable}
-                  title="While the preview is paused the level comes from the fullscreen output window. Nothing has arrived in the last two seconds, so the meter reads nothing instead of zero."
-                >
-                  Waiting for the output window
+              )}
+            </div>
+
+            <div style={styles.infoSection}>
+              <div style={styles.infoRow}>
+                <span style={styles.label}>File</span>
+                <span style={styles.value} title={currentItem ? currentItem.name : ''}>
+                  {currentItem ? currentItem.name : '-'}
                 </span>
-                <span style={styles.vuLevel}>N/A</span>
-              </>
-            )}
+              </div>
+              <div style={styles.infoRow}>
+                <span style={styles.label}>Duration</span>
+                <span style={styles.valueNum}>
+                  {currentItem ? (currentItem.duration_formatted || currentItem.duration || '-') : '-'}
+                </span>
+              </div>
+              <div style={styles.infoRow}>
+                <span style={styles.label}>Size</span>
+                <span style={styles.valueNum}>
+                  {currentItem && currentItem.file_size ? (
+                    <>
+                      {currentItem.file_size}
+                      {currentItem.bitrate && ` • ${currentItem.bitrate}`}
+                      {bitrateTag && <span style={{ color: bitrateTag.color, fontWeight: '600' }}>{bitrateTag.label}</span>}
+                    </>
+                  ) : '-'}
+                </span>
+              </div>
+              <div style={styles.infoRow}>
+                <span style={styles.label}>Format</span>
+                <span style={styles.value}>{currentItem && currentItem.format ? currentItem.format : '-'}</span>
+              </div>
+              <div style={styles.infoRow}>
+                <span style={styles.label}>Status</span>
+                <span style={{ ...styles.value, color: status.color, fontWeight: '600' }} title={status.title}>
+                  {status.text}
+                </span>
+              </div>
+            </div>
           </div>
+
+          <AudioStrip
+            level={audioLevel}
+            metering={meterAvailable}
+            active={hasAudio}
+            volume={volume}
+            onVolumeChange={onVolumeChange}
+          />
         </div>
       </div>
     </div>
@@ -250,6 +241,16 @@ const styles = {
     width: '34px',
     textAlign: 'right'
   },
+  body: {
+    display: 'flex',
+    alignItems: 'stretch'
+  },
+  mainColumn: {
+    flex: 1,
+    minWidth: 0,
+    display: 'flex',
+    flexDirection: 'column'
+  },
   videoArea: {
     width: '100%',
     aspectRatio: '16/9',
@@ -267,7 +268,8 @@ const styles = {
     border: 'none',
     position: 'absolute',
     top: 0,
-    left: 0
+    left: 0,
+    pointerEvents: 'none'
   },
   pausedPanel: {
     width: '100%',
@@ -325,17 +327,11 @@ const styles = {
     fontWeight: '600'
   },
   infoSection: {
+    flex: 1,
     padding: '12px',
     background: 'var(--bg-layer-1)'
   },
   infoRow: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '10px',
-    height: '26px',
-    borderBottom: '1px solid var(--stroke-subtle)'
-  },
-  audioRow: {
     display: 'flex',
     alignItems: 'center',
     gap: '10px',
@@ -370,35 +366,6 @@ const styles = {
     overflow: 'hidden',
     textOverflow: 'ellipsis',
     whiteSpace: 'nowrap',
-    fontFamily: 'var(--font-mono)',
-    fontVariantNumeric: 'tabular-nums'
-  },
-  vuMeterContainer: {
-    flex: 1,
-    minWidth: 0,
-    height: '14px',
-    background: 'var(--bg-base)',
-    borderRadius: '999px',
-    overflow: 'hidden',
-    border: '1px solid var(--stroke)'
-  },
-  vuUnavailable: {
-    flex: 1,
-    minWidth: 0,
-    fontSize: '10px',
-    color: 'var(--text-quaternary)',
-    lineHeight: '1.3',
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap'
-  },
-  vuLevel: {
-    fontSize: '11px',
-    color: 'var(--text-secondary)',
-    fontWeight: '600',
-    width: '42px',
-    flexShrink: 0,
-    textAlign: 'right',
     fontFamily: 'var(--font-mono)',
     fontVariantNumeric: 'tabular-nums'
   }

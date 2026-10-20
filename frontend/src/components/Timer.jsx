@@ -1,7 +1,6 @@
 import React, { useState, useRef } from 'react'
-import Icon from './Icon'
 
-const Timer = ({ currentItem, isPlaying, serverElapsed = 0, editMode = false, onToggleEditMode, onSeek, volume = 100, onVolumeChange }) => {
+const Timer = ({ currentItem, isPlaying, serverElapsed = 0, editMode = false, onToggleEditMode, onSeek }) => {
   const [dragPct, setDragPct] = useState(null)
   const barRef = useRef(null)
   const dragRef = useRef(false)
@@ -41,7 +40,7 @@ const Timer = ({ currentItem, isPlaying, serverElapsed = 0, editMode = false, on
   }
 
   const startScrub = (e) => {
-    if (!canScrub || dragRef.current) return
+    if (!canScrub || dragRef.current || e.button !== 0) return
     e.preventDefault()
 
     const target = e.currentTarget
@@ -118,22 +117,6 @@ const Timer = ({ currentItem, isPlaying, serverElapsed = 0, editMode = false, on
         <span style={styles.infoText}>{formatTime(currentTime)} elapsed</span>
         <span style={styles.infoText}>{formatTime(totalTime)} total</span>
       </div>
-
-      <div style={styles.volumeRow}>
-        <span style={volume === 0 ? styles.volumeIconMuted : styles.volumeIcon}>
-          <Icon name="volume" size={16} />
-        </span>
-        <input
-          type="range"
-          min="0"
-          max="100"
-          value={volume}
-          onChange={(e) => onVolumeChange && onVolumeChange(Number(e.target.value))}
-          style={styles.volumeSlider}
-          title="Output volume"
-        />
-        <span style={styles.volumeValue}>{volume}%</span>
-      </div>
     </div>
   )
 }
@@ -172,13 +155,6 @@ const timeValueBase = {
   lineHeight: 1,
   minWidth: '5ch',
   transition: 'color 0.12s ease'
-}
-
-const volumeSliderBase = {
-  flex: 1,
-  height: '18px',
-  accentColor: 'var(--accent)',
-  cursor: 'pointer'
 }
 
 const styles = {
@@ -278,37 +254,6 @@ const styles = {
   infoText: {
     fontFamily: 'var(--font-mono)',
     fontVariantNumeric: 'tabular-nums'
-  },
-  volumeRow: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: '10px',
-    marginTop: '10px',
-    paddingTop: '10px',
-    borderTop: '1px solid var(--stroke-subtle)'
-  },
-  volumeIcon: {
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    width: '18px',
-    color: 'var(--text-secondary)'
-  },
-  volumeIconMuted: {
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    width: '18px',
-    color: 'var(--text-quaternary)'
-  },
-  volumeSlider: volumeSliderBase,
-  volumeValue: {
-    fontSize: '11px',
-    color: 'var(--text-secondary)',
-    fontFamily: 'var(--font-mono)',
-    fontVariantNumeric: 'tabular-nums',
-    minWidth: '42px',
-    textAlign: 'right'
   }
 }
 

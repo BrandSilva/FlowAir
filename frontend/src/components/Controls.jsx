@@ -39,11 +39,17 @@ const keyOf = (shortcuts, id) => {
   return typeof value === 'string' && value ? value : DEFAULT_KEYS[id]
 }
 
-const Controls = ({ isPlaying, selectedItem, selectedItems = [], onPlay, onStop, onNext, onCue, shortcuts }) => {
+const Controls = ({ isPlaying, selectedItem, selectedItems = [], canCue = false, onPlay, onStop, onNext, onCue, shortcuts }) => {
   const playKey = keyOf(shortcuts, 'play')
   const stopKey = keyOf(shortcuts, 'stop')
   const nextKey = keyOf(shortcuts, 'next')
   const cueKey = keyOf(shortcuts, 'cue')
+  const hasSelection = !!selectedItem || selectedItems.length > 0
+  const cueTitle = canCue
+    ? `Cue selected item (${cueKey})`
+    : selectedItems.length > 1
+      ? 'Select a single item to cue'
+      : (hasSelection ? 'Select a video or image that can be cued' : 'Select an item first')
 
   const getSelectionText = () => {
     const count = selectedItems.length || 0
@@ -110,11 +116,11 @@ const Controls = ({ isPlaying, selectedItem, selectedItems = [], onPlay, onStop,
           NEXT
         </button>
         <button
-          style={selectedItem ? styles.cueButton : styles.cueButtonDisabled}
+          style={canCue ? styles.cueButton : styles.cueButtonDisabled}
           {...transportProps}
           onClick={() => { releaseFocus(); onCue() }}
-          disabled={!selectedItem}
-          title={selectedItem ? `Cue selected item (${cueKey})` : 'Select an item first'}
+          disabled={!canCue}
+          title={cueTitle}
         >
           <Icon name="cue" size={18} />
           CUE

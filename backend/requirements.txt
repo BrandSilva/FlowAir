@@ -3,3 +3,15 @@ uvicorn==0.27.0
 websockets==12.0
 psutil==5.9.8
 obsws-python==1.8.0
+annotated-types==0.8.0
+anyio==4.14.2
+click==8.4.2
+colorama==0.4.6
+h11==0.16.0
+idna==3.19
+pydantic==2.13.4
+pydantic-core==2.46.4
+starlette==0.35.1
+typing-extensions==4.16.0
+typing-inspection==0.4.4
+websocket-client==1.9.0

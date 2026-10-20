@@ -16,7 +16,9 @@ const iconPath = path.join(__dirname, 'icon.ico')
 const venvPython = path.join(backendDir, 'venv', 'Scripts', 'python.exe')
 const taskkillPath = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe')
 const pyinstallerVersion = '6.22.3'
+const pyinstallerHooksVersion = '2026.7'
 const minimumPython = [3, 11]
+const maximumPython = [3, 14]
 const artifactName = 'FlowAir-Setup.exe'
 const installerResources = ['icon.ico', 'installer.nsh', 'installerHeader.bmp', 'installerSidebar.bmp', 'ffmpeg-license.txt']
 const packagedAppEntries = [
@@ -178,7 +180,7 @@ function writeVersionFile(target) {
   fs.writeFileSync(target, content, 'utf-8')
 }
 
-function warnOnOldPython() {
+function checkVenvPython() {
   let config = ''
   try {
     config = fs.readFileSync(path.join(backendDir, 'venv', 'pyvenv.cfg'), 'utf-8')
@@ -191,6 +193,9 @@ function warnOnOldPython() {
   }
   const major = parseInt(found[1], 10)
   const minor = parseInt(found[2], 10)
+  if (major > maximumPython[0] || (major === maximumPython[0] && minor > maximumPython[1])) {
+    throw new Error(`backend/venv uses Python ${major}.${minor}, but the playout engine dependencies are pinned for Python ${minimumPython.join('.')} to ${maximumPython.join('.')}. Delete backend/venv and build again with Python ${maximumPython.join('.')}.`)
+  }
   if (major < minimumPython[0] || (major === minimumPython[0] && minor < minimumPython[1])) {
     warn(`The playout engine is being packaged with Python ${major}.${minor}. FlowAir is released with Python ${minimumPython.join('.')} or newer, so this installer may not match the published one. Delete backend/venv and build again with a newer Python.`)
   }
@@ -201,9 +206,9 @@ function ensureBackendEnvironment() {
     log('Creating Python virtual environment')
     run('python', ['-m', 'venv', 'venv'], backendDir)
   }
-  warnOnOldPython()
+  checkVenvPython()
   log('Installing playout engine dependencies')
-  run(venvPython, ['-m', 'pip', 'install', '--disable-pip-version-check', '--quiet', '-r', 'requirements.txt', `pyinstaller==${pyinstallerVersion}`], backendDir)
+  run(venvPython, ['-m', 'pip', 'install', '--disable-pip-version-check', '--quiet', '-r', 'requirements.txt', `pyinstaller==${pyinstallerVersion}`, `pyinstaller-hooks-contrib==${pyinstallerHooksVersion}`], backendDir)
 }
 
 function buildEngine() {
@@ -266,19 +271,37 @@ const clipEncoders = [
   ['-c:v', 'h264_mf', '-pix_fmt', 'nv12']
 ]
 
+function readToolVersion(tool) {
+  let output = ''
+  try {
+    output = execFileSync(tool, ['-hide_banner', '-version'], { stdio: ['ignore', 'pipe', 'ignore'], encoding: 'utf-8', windowsHide: true, timeout: 30000 })
+  } catch (error) {
+    throw new Error(`${path.basename(tool)} at ${tool} does not run: ${error.message}`)
+  }
+  const firstLine = output.split(/\r?\n/, 1)[0].trim()
+  const found = /\bversion\s+(\S+)/.exec(firstLine)
+  if (found === null) {
+    throw new Error(`${path.basename(tool)} at ${tool} did not report its version (first line: "${firstLine}")`)
+  }
+  return found[1]
+}
+
 function verifyMediaTools() {
+  const bundled = []
   for (const tool of [ffprobePath, ffmpegPath]) {
     if (!fs.existsSync(tool) || fs.statSync(tool).size === 0) {
       throw new Error(`${path.basename(tool)} was not found at ${tool}. FlowAir ships both ffprobe.exe and ffmpeg.exe.`)
     }
-    try {
-      execFileSync(tool, ['-hide_banner', '-version'], { stdio: 'ignore', windowsHide: true, timeout: 30000 })
-    } catch (error) {
-      throw new Error(`${path.basename(tool)} at ${tool} does not run: ${error.message}`)
-    }
+    bundled.push({ name: path.basename(tool), version: readToolVersion(tool) })
   }
-  if (!fs.existsSync(ffmpegLicensePath) || !fs.readFileSync(ffmpegLicensePath, 'utf-8').includes('GNU GENERAL PUBLIC LICENSE')) {
+  const notice = fs.existsSync(ffmpegLicensePath) ? fs.readFileSync(ffmpegLicensePath, 'utf-8') : ''
+  if (!notice.includes('GNU GENERAL PUBLIC LICENSE')) {
     throw new Error(`The FFmpeg licence and source notice was not found at ${ffmpegLicensePath}. It must ship next to ffmpeg.exe.`)
+  }
+  for (const tool of bundled) {
+    if (!notice.includes(tool.version)) {
+      throw new Error(`The FFmpeg licence and source notice at ${ffmpegLicensePath} does not name the bundled ${tool.name} (version ${tool.version}). The shipped notice must describe the FFmpeg build in ffmpeg/bin: update the notice, or put back the build it names.`)
+    }
   }
 }
 

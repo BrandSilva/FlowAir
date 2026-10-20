@@ -30,7 +30,13 @@ const INSTALL_FAILURE_MESSAGES = {
   'not-ready': 'The update has not been downloaded yet',
   'missing': 'The downloaded update is missing, download it again',
   'installing': 'The update is already being installed',
-  'launch-failed': 'The installer could not be started, open it from the updates folder'
+  'launch-failed': 'The installer could not be started, click Install now in the update panel to try again'
+}
+const PLAYLIST_FILE_FAILURES = {
+  missing: 'the file was not found',
+  empty: 'the file is empty',
+  'too-large': 'the file is too large',
+  unreadable: 'the file cannot be read'
 }
 
 const ENGINE_OUTPUT_KEYS = ['resolution', 'aspectRatio', 'quality', 'scalingMode', 'networkStreamingEnabled', 'audioDeviceLabel']
@@ -75,6 +81,12 @@ const hasActiveConversion = (items) => items.some(item => ACTIVE_CONVERSION.incl
 
 const isPreparingItem = (item) => item.playability === 'preparing' || ACTIVE_CONVERSION.includes(conversionStatusOf(item))
 
+const isCueableItem = (item) => Boolean(item)
+  && (item.type === 'video' || item.type === 'image')
+  && item.status !== 'corrupted'
+  && item.playability !== 'unsupported'
+  && !isPreparingItem(item)
+
 const mergeConversion = (item, patch) => {
   const previous = item.conversion && typeof item.conversion === 'object' ? item.conversion : {}
   const next = { ...previous, ...patch }
@@ -97,7 +109,8 @@ const IPC_CHANNELS = [
   'update-available',
   'update:state',
   'update:progress',
-  'open-playlist-file'
+  'open-playlist-file',
+  'open-playlist-file-failed'
 ]
 
 const SHORTCUT_STORAGE_KEY = 'flowair.shortcuts'
@@ -190,6 +203,8 @@ const isTypingTarget = (target) => {
 }
 
 const ACTIVATION_SCOPES = '.update-panel, .pl-find'
+
+const SELECTION_KEEP_SCOPES = '.playlist-container, button, input, select, [role="slider"], .log-head'
 
 const isActivationTarget = (target, key) => {
   if (key !== ' ' && key !== 'Enter') return false
@@ -298,6 +313,14 @@ const extractPlaylistItems = (data) => {
   if (data && Array.isArray(data.playlist)) return data.playlist
   if (data && Array.isArray(data.items)) return data.items
   return []
+}
+
+const parseAutosaveSignature = (signature) => {
+  try {
+    return extractPlaylistItems(JSON.parse(signature))
+  } catch (error) {
+    return null
+  }
 }
 
 const describeItem = (item) => {
@@ -474,6 +497,19 @@ const formatClock = (date, timeFormat) => {
 
 const formatDate = (date) => {
   return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+}
+
+const formatCheckedAt = (timestamp, timeFormat) => {
+  const date = new Date(timestamp)
+  const time = formatClock(date, timeFormat)
+  return date.toDateString() === new Date().toDateString() ? time : `${formatDate(date)} ${time}`
+}
+
+const describeUpdateCheck = (state, timeFormat) => {
+  if (state.enabled === false) return 'Automatic update checks are off.'
+  if (state.checkFailed) return 'The update server could not be reached. FlowAir keeps trying.'
+  if (state.checkedAt > 0) return `FlowAir is up to date (checked ${formatCheckedAt(state.checkedAt, timeFormat)}).`
+  return 'Checking for updates...'
 }
 
 const DEFAULT_DIAGNOSTICS = {
@@ -753,7 +789,9 @@ const App = () => {
     downloaded: false,
     progress: 0,
     error: '',
-    enabled: true
+    enabled: true,
+    checkedAt: 0,
+    checkFailed: false
   })
   const [showUpdatePanel, setShowUpdatePanel] = useState(false)
   const updateDownloadRequested = useRef(false)
@@ -803,6 +841,7 @@ const App = () => {
   const obsConnectedRef = useRef(false)
   const obsReconnectStep = useRef(0)
   const obsNextAttempt = useRef(0)
+  const outputVolumeRef = useRef(outputVolume)
 
   useEffect(() => {
     playlistRef.current = playlist
@@ -815,7 +854,8 @@ const App = () => {
     obsSettingsRef.current = obsSettings
     obsScenesRef.current = obsScenes
     conversionSettingsRef.current = conversionSettings
-  }, [playlist, playlistRevision, currentItem, isPlaying, selectedItems, copiedItems, outputSettings, obsSettings, obsScenes, conversionSettings])
+    outputVolumeRef.current = outputVolume
+  }, [playlist, playlistRevision, currentItem, isPlaying, selectedItems, copiedItems, outputSettings, obsSettings, obsScenes, conversionSettings, outputVolume])
 
   const searchNeedle = searchOpen ? searchQuery.trim().toLowerCase() : ''
   const filterActive = searchNeedle.length > 0
@@ -908,6 +948,13 @@ const App = () => {
 
   const clearUndoStack = useCallback(() => {
     undoStack.current = []
+  }, [])
+
+  const resetAutosave = useCallback(() => {
+    clearTimeout(autosaveTimer.current)
+    pendingAutosave.current = null
+    autosaveReady.current = false
+    lastAutosaveRevision.current = -1
   }, [])
 
   const getCurrentIndex = useCallback(() => {
@@ -1144,6 +1191,11 @@ const App = () => {
 
     api.updateOutputSettings(outputSettingsRef.current).catch(() => {})
     api.updateConversionSettings({ ...conversionSettingsRef.current, gpu_degraded: gpuDegradedRef.current }).catch(() => {})
+    api.getPlayerState()
+      .then(state => {
+        if (state && typeof state.volume === 'number' && pendingVolume.current === null) setOutputVolume(state.volume)
+      })
+      .catch(() => {})
     if (obsSettingsRef.current.enabled) {
       api.updateOBSSettings(obsSettingsRef.current)
         .then(() => api.obsConnect())
@@ -1238,6 +1290,7 @@ const App = () => {
       } else if (data.type === 'audio_level') {
         audioLevelSource.publish(typeof data.level === 'number' ? data.level : 0)
       } else if (data.type === 'file_missing') {
+        if (wsPauseDepth.current === 0 && Array.isArray(data.playlist)) applyPlaylistState(data, true)
         addLog(`File missing: ${data.message}`, 'error')
       }
     })
@@ -1246,25 +1299,50 @@ const App = () => {
     if (electron) {
       const { ipcRenderer } = electron
       ipcRenderer.on('output-window-closed', (event, info) => {
-        setOutputWindowActive(false)
-        setOutputSettings(prev => ({ ...prev, externalOutputEnabled: false }))
         const reason = info && info.reason
+        setOutputWindowActive(false)
+        setOutputSettings(prev => {
+          const updated = { ...prev, externalOutputEnabled: false }
+          if (reason === 'shortcut') localStorage.setItem('outputSettings', JSON.stringify(updated))
+          return updated
+        })
         if (reason === 'display-missing') {
           addLog('External output display is not connected', 'warning')
         } else if (reason === 'display-removed') {
           addLog('External output display was disconnected', 'warning')
+        } else if (reason === 'closed') {
+          const binding = shortcutsRef.current.output
+          addLog(binding
+            ? `External output window was closed, press ${binding} to reopen it`
+            : 'External output window was closed, reopen it in Settings > Output', 'warning')
         } else {
           addLog('External output closed', 'info')
         }
       })
-      ipcRenderer.on('output-window-opened', () => {
+      ipcRenderer.on('output-window-opened', (event, info) => {
+        const displayId = info && typeof info.displayId === 'number' ? info.displayId : null
         setOutputWindowActive(true)
+        setOutputSettings(prev => {
+          const updated = { ...prev, externalOutputEnabled: true, ...(displayId === null ? {} : { selectedDisplayId: displayId }) }
+          localStorage.setItem('outputSettings', JSON.stringify(updated))
+          return updated
+        })
+        if (info && info.reason === 'display-returned') {
+          addLog('External output display reconnected, output restored', 'info')
+        }
       })
       ipcRenderer.on('displays-changed', () => {
         loadDisplays()
       })
-      ipcRenderer.on('backend-restarted', () => {
+      ipcRenderer.on('backend-restarted', (event, info) => {
+        const latestAutosave = pendingAutosave.current || lastAutosave.current
+        const ownItems = latestAutosave ? parseAutosaveSignature(latestAutosave) : null
+        resetAutosave()
+        setSelectedItems([])
+        lastSelectedId.current = null
+        selectionFocusId.current = null
         clearUndoStack()
+        applyPlaylistState({ playlist: [], current_item: null, is_playing: false, revision: -1 }, true)
         loadPlaylist()
         const settings = outputSettingsRef.current
         api.getOutputSettings()
@@ -1276,6 +1354,7 @@ const App = () => {
           })
           .catch(() => {})
         api.updateConversionSettings({ ...conversionSettingsRef.current, gpu_degraded: gpuDegradedRef.current }).catch(() => {})
+        api.setPlayerVolume(outputVolumeRef.current).catch(() => {})
         const obs = obsSettingsRef.current
         if (obs.enabled) {
           obsReconnectStep.current = 0
@@ -1291,9 +1370,21 @@ const App = () => {
             .catch(() => {})
         }
         addLog('Playout engine restarted after an unexpected stop', 'error')
+        const autosave = info && info.autosave
+        const recovered = ownItems || extractPlaylistItems(autosave)
+        if (recovered.length > 0) {
+          setRecoverySession({ items: recovered, savedAt: autosave ? autosave.savedAt : null, reason: 'engine-restart' })
+        } else {
+          autosaveReady.current = true
+        }
       })
       ipcRenderer.on('open-playlist-file', (event, filePath) => {
         if (openPlaylistFileRef.current) openPlaylistFileRef.current(filePath)
+      })
+      ipcRenderer.on('open-playlist-file-failed', (event, info) => {
+        const name = info && info.name ? info.name : 'the playlist file'
+        const reason = (info && PLAYLIST_FILE_FAILURES[info.reason]) || PLAYLIST_FILE_FAILURES.unreadable
+        addLog(`Cannot open ${name}: ${reason}`, 'warning')
       })
       ipcRenderer.on('update-available', (event, update) => {
         if (update && update.version) {
@@ -1331,6 +1422,7 @@ const App = () => {
         .catch(() => {
           autosaveReady.current = true
         })
+      ipcRenderer.send('renderer-ready')
     } else {
       autosaveReady.current = true
     }
@@ -1343,7 +1435,7 @@ const App = () => {
         IPC_CHANNELS.forEach(channel => electron.ipcRenderer.removeAllListeners(channel))
       }
     }
-  }, [addLog, applyPlaylistState, audioLevelSource, clearUndoStack, loadDiagnostics, loadDisplays, loadNetworkInfo, loadPlaylist, restoreOutputWindow])
+  }, [addLog, applyPlaylistState, audioLevelSource, clearUndoStack, loadDiagnostics, loadDisplays, loadNetworkInfo, loadPlaylist, resetAutosave, restoreOutputWindow])
 
   const conversionActive = useMemo(() => hasActiveConversion(playlist), [playlist])
 
@@ -1420,13 +1512,19 @@ const App = () => {
 
   useEffect(() => {
     if (!autosaveReady.current) return
+    if (playlistRevision >= 0 && lastAutosaveRevision.current >= 0 && playlistRevision < lastAutosaveRevision.current) return
     if (playlistRevision >= 0) {
       if (playlistRevision === lastAutosaveRevision.current) return
       lastAutosaveRevision.current = playlistRevision
     }
     const payload = serializePlaylistItems(playlist)
     const signature = JSON.stringify(payload)
-    if (signature === lastAutosave.current || signature === pendingAutosave.current) return
+    if (signature === lastAutosave.current) {
+      clearTimeout(autosaveTimer.current)
+      pendingAutosave.current = null
+      return
+    }
+    if (signature === pendingAutosave.current) return
     pendingAutosave.current = signature
     clearTimeout(autosaveTimer.current)
     autosaveTimer.current = setTimeout(() => {
@@ -1490,6 +1588,11 @@ const App = () => {
           obsConnectedRef.current = true
           setOBSConnected(true)
         }
+        api.getOBSCurrentScene()
+          .then(data => {
+            if (!cancelled && data && data.scene) setObsCurrentScene(data.scene)
+          })
+          .catch(() => {})
         return
       }
 
@@ -1541,14 +1644,20 @@ const App = () => {
   }, [obsConnected, obsSelectedScene])
 
   useEffect(() => {
-    if (showOBSEventModal && obsEventScene) {
-      api.getOBSSceneSources(obsEventScene).then(data => {
-        const sources = data.sources || []
-        setOBSEventSources(sources)
-        if (sources.length > 0) {
-          setOBSEventSource(sources[0].sourceName)
-        }
-      }).catch(() => setOBSEventSources([]))
+    if (!showOBSEventModal || !obsEventScene) return
+    let cancelled = false
+    api.getOBSSceneSources(obsEventScene).then(data => {
+      if (cancelled) return
+      const sources = (data && data.sources) || []
+      setOBSEventSources(sources)
+      if (sources.length > 0) {
+        setOBSEventSource(prev => (sources.some(source => source.sourceName === prev) ? prev : sources[0].sourceName))
+      }
+    }).catch(() => {
+      if (!cancelled) setOBSEventSources([])
+    })
+    return () => {
+      cancelled = true
     }
   }, [showOBSEventModal, obsEventScene])
 
@@ -1805,32 +1914,45 @@ const App = () => {
       return
     }
     if (selected.length === 0) return
-    if (!beginOperation()) return
 
     const items = playlistRef.current
-    const itemsToDelete = [...selected]
-    const originalIndices = itemsToDelete.map(item => items.findIndex(i => i.id === item.id))
+    const selectedIds = new Set(selected.map(item => item.id))
+    const originalIndices = items.reduce((acc, item, index) => {
+      if (selectedIds.has(item.id)) acc.push(index)
+      return acc
+    }, [])
+    if (originalIndices.length === 0) return
+    if (!beginOperation()) return
+
+    const itemsToDelete = originalIndices.map(index => items[index])
 
     setSelectedItems([])
     pauseWS()
 
     try {
-      await Promise.all(itemsToDelete.map(item => api.removeItem(item.id)))
+      const results = await Promise.all(itemsToDelete.map(item => api.removeItem(item.id)))
+      const refused = results.map(result => Boolean(result && result.success === false))
+      const deleted = itemsToDelete.filter((item, position) => !refused[position])
+      const deletedIndices = originalIndices.filter((index, position) => !refused[position])
 
       const finalState = await api.getPlaylist()
       applyPlaylistState(finalState)
 
-      if (itemsToDelete.length <= MAX_UNDO_ITEMS) {
+      if (deleted.length > MAX_UNDO_ITEMS) {
+        addLog('Too many items to keep an undo action', 'warning')
+      } else if (deleted.length > 0) {
         pushAction({
           type: 'removed_items',
-          runs: buildRestoreRuns(serializePlaylistItems(itemsToDelete), originalIndices),
-          label: `deleted ${itemCountLabel(itemsToDelete.length)}`
+          runs: buildRestoreRuns(serializePlaylistItems(deleted), deletedIndices),
+          label: `deleted ${itemCountLabel(deleted.length)}`
         })
-      } else {
-        addLog('Too many items to keep an undo action', 'warning')
       }
 
-      addLog(`Deleted ${itemsToDelete.length} item(s)`, 'info')
+      if (deleted.length === itemsToDelete.length) {
+        addLog(`Deleted ${deleted.length} item(s)`, 'info')
+      } else {
+        addLog(`Deleted ${deleted.length} of ${itemsToDelete.length} item(s), the engine kept the rest`, 'warning')
+      }
     } catch (error) {
       addLog('Error deleting items', 'error')
     } finally {
@@ -2142,9 +2264,18 @@ const App = () => {
   }, [addLog, applyPlaylistState, beginOperation, clampInsertIndex, duplicateItemAt, endOperation, insertedItemId, pauseWS, pushAction, resumeWS, toPlaylistIndex])
 
   const handlePlay = useCallback(async () => {
+    if (isPlayingRef.current) return
     try {
-      await api.play()
-      setIsPlaying(true)
+      const result = await api.play()
+      if (result && result.success === false) {
+        addLog('Error starting playback', 'error')
+        return
+      }
+      if (result && typeof result.is_playing === 'boolean') setIsPlaying(result.is_playing)
+      if (result && result.is_playing === false) {
+        addLog('Nothing playable to start from this position', 'warning')
+        return
+      }
       addLog('Playback started', 'playback')
     } catch (error) {
       addLog('Error starting playback', 'error')
@@ -2165,16 +2296,25 @@ const App = () => {
     try {
       const selected = selectedItemsRef.current
       if (selected.length === 1) {
-        const item = selected[0]
+        const target = selected[0]
         const current = currentItemRef.current
-        const isCurrentPlaying = current && current.id === item.id
+        const isCurrentPlaying = current && current.id === target.id
 
         if (isCurrentPlaying) {
           await api.next()
           setSelectedItems([])
           addLog('Skipped to next item', 'playback')
-        } else if (item.type === 'video' || item.type === 'image') {
-          await api.cue(item.id)
+        } else if (target.type === 'video' || target.type === 'image') {
+          const item = playlistRef.current.find(entry => entry.id === target.id)
+          if (!isCueableItem(item)) {
+            addLog('This item cannot be cued', 'warning')
+            return
+          }
+          const cued = await api.cue(item.id)
+          if (cued && cued.success === false) {
+            addLog('This item cannot be cued', 'warning')
+            return
+          }
           await api.play()
           setSelectedItems([])
           addLog(`Jumped to selected item: ${item.name}`, 'playback')
@@ -2303,10 +2443,11 @@ const App = () => {
 
   const handleRestoreSession = useCallback(async () => {
     if (!recoverySession) return
+    if (!beginOperation()) return
     const { items } = recoverySession
     setRecoverySession(null)
     autosaveReady.current = true
-    if (!beginOperation()) return
+    lastAutosaveRevision.current = -1
     try {
       const count = await insertPlaylistItems(items, playlistRef.current.length, 'restored the last session')
       addLog(`Restored ${count} item(s) from the last session`, 'info')
@@ -2320,6 +2461,7 @@ const App = () => {
   const handleDismissSession = useCallback(() => {
     setRecoverySession(null)
     autosaveReady.current = true
+    lastAutosaveRevision.current = -1
     lastAutosave.current = JSON.stringify([])
     const electron = getElectron()
     if (electron) {
@@ -2376,8 +2518,17 @@ const App = () => {
   }, [addLog])
 
   const handleCue = useCallback(async (itemId) => {
+    const item = playlistRef.current.find(entry => entry.id === itemId)
+    if (!isCueableItem(item)) {
+      addLog('This item cannot be cued', 'warning')
+      return
+    }
     try {
-      await api.cue(itemId)
+      const result = await api.cue(itemId)
+      if (result && result.success === false) {
+        addLog('This item cannot be cued', 'warning')
+        return
+      }
       addLog('Item cued and loaded to preview', 'info')
     } catch (error) {
       addLog('Error cueing item', 'error')
@@ -2395,13 +2546,25 @@ const App = () => {
     try {
       const currentPlaylist = await api.getPlaylist()
       const items = currentPlaylist.playlist || []
+      const onAir = currentPlaylist.current_item
+      if (currentPlaylist.is_playing && onAir && onAir.id === itemId) {
+        applyPlaylistState(currentPlaylist)
+        addLog('Cannot delete the item currently on air', 'warning')
+        return
+      }
       const itemIndex = items.findIndex(i => i.id === itemId)
       const itemToDelete = itemIndex >= 0 ? items[itemIndex] : null
 
-      await api.removeItem(itemId)
+      const result = await api.removeItem(itemId)
 
       const finalState = await api.getPlaylist()
       applyPlaylistState(finalState)
+
+      if (result && result.success === false) {
+        addLog(result.error || 'The item could not be removed', 'warning')
+        return
+      }
+
       setSelectedItems(prev => prev.filter(i => i.id !== itemId))
 
       if (itemToDelete) {
@@ -3116,6 +3279,16 @@ const App = () => {
       .catch(() => {})
   }, [addLog])
 
+  const checkForUpdatesNow = useCallback(() => {
+    const electron = getElectron()
+    if (!electron) return
+    electron.ipcRenderer.invoke('update:check-now')
+      .then(state => {
+        if (state && typeof state === 'object') setUpdateState(prev => ({ ...prev, ...state }))
+      })
+      .catch(() => {})
+  }, [])
+
   const installUpdate = useCallback(() => {
     const electron = getElectron()
     if (!electron) return
@@ -3251,10 +3424,10 @@ const App = () => {
   }, [assignShortcut, capturingAction])
 
   useEffect(() => {
-    if (showOutputSettings && settingsTab === 'shortcuts') return
+    if (showOutputSettings && settingsTab === 'shortcuts' && !confirmDialog && !recoverySession) return
     setCapturingAction(null)
     setShortcutMessage('')
-  }, [showOutputSettings, settingsTab])
+  }, [showOutputSettings, settingsTab, confirmDialog, recoverySession])
 
   useEffect(() => {
     const binding = shortcutsRef.current.output
@@ -3471,6 +3644,11 @@ const App = () => {
 
   const selectedItem = useMemo(() => (selectedItems.length === 1 ? selectedItems[0] : null), [selectedItems])
 
+  const canCue = useMemo(() => {
+    if (!selectedItem) return false
+    return isCueableItem(playlist.find(item => item.id === selectedItem.id))
+  }, [playlist, selectedItem])
+
   const nextHighlightId = useMemo(
     () => resolveNextHighlightId(playlist, currentItem, isPlaying, serverElapsed),
     [playlist, currentItem, isPlaying, serverElapsed]
@@ -3565,14 +3743,7 @@ const App = () => {
 
   const handleContainerClick = useCallback((e) => {
     if (confirmDialog || recoverySession || showNoteInput || showOBSEventModal || showOutputSettings || showUpdatePanel) return
-
-    const clickedPlaylist = e.target.closest('.playlist-container')
-    const clickedButton = e.target.closest('button')
-    const clickedInput = e.target.closest('input')
-
-    if (!clickedPlaylist && !clickedButton && !clickedInput) {
-      handleClearSelection()
-    }
+    if (!e.target.closest(SELECTION_KEEP_SCOPES)) handleClearSelection()
   }, [confirmDialog, handleClearSelection, recoverySession, showNoteInput, showOBSEventModal, showOutputSettings, showUpdatePanel])
 
   const electronAvailable = useMemo(() => Boolean(getElectron()), [])
@@ -3777,7 +3948,7 @@ const App = () => {
 
             <div style={styles.updatePanelBody}>
               {!updateAvailable && updateState.status !== 'error' && (
-                <div style={styles.updateText}>FlowAir is up to date.</div>
+                <div style={styles.updateText}>{describeUpdateCheck(updateState, timeFormat)}</div>
               )}
 
               {updateState.status === 'available' && (
@@ -3814,7 +3985,10 @@ const App = () => {
                 <input
                   type="checkbox"
                   checked={updateState.enabled !== false}
-                  onChange={(e) => setUpdateChecksEnabled(e.target.checked)}
+                  onChange={(e) => {
+                    setUpdateChecksEnabled(e.target.checked)
+                    e.target.blur()
+                  }}
                   style={styles.checkbox}
                 />
                 Check for updates automatically
@@ -3837,6 +4011,9 @@ const App = () => {
               {updateState.status === 'error' && (
                 <button style={{ ...styles.modalButton, ...styles.modalButtonPrimary }} onClick={startUpdateDownload}>Retry</button>
               )}
+              {electronAvailable && updateState.enabled !== false && updateState.status !== 'downloading' && updateState.status !== 'installing' && (
+                <button style={{ ...styles.modalButton, ...styles.modalButtonCancel }} onClick={checkForUpdatesNow}>Check now</button>
+              )}
               {updateState.url && (
                 <button style={{ ...styles.modalButton, ...styles.modalButtonCancel }} onClick={openReleasePage}>Release page</button>
               )}
@@ -3855,6 +4032,7 @@ const App = () => {
             isPlaying={isPlaying}
             selectedItem={selectedItem}
             selectedItems={selectedItems}
+            canCue={canCue}
             onPlay={handlePlay}
             onStop={handleStop}
             onNext={handleNext}
@@ -3869,8 +4047,6 @@ const App = () => {
             editMode={editMode}
             onToggleEditMode={setEditMode}
             onSeek={handleSeek}
-            volume={outputVolume}
-            onVolumeChange={handleVolumeChange}
           />
 
           <MemoPlaylist
@@ -3918,6 +4094,8 @@ const App = () => {
             countdown={previewCountdown}
             onResumePreview={handleResumePreview}
             audioLevelSource={audioLevelSource}
+            volume={outputVolume}
+            onVolumeChange={handleVolumeChange}
           />
           {obsSettings.enabled && obsConnected && (
             <div style={styles.obsControlPanel}>
@@ -3930,7 +4108,10 @@ const App = () => {
                   <select
                     style={styles.obsSceneSelect}
                     value={obsSelectedScene}
-                    onChange={(e) => setOBSSelectedScene(e.target.value)}
+                    onChange={(e) => {
+                      setOBSSelectedScene(e.target.value)
+                      e.target.blur()
+                    }}
                   >
                     {obsScenes.map(scene => (
                       <option key={scene} value={scene}>{scene}</option>
@@ -3980,33 +4161,6 @@ const App = () => {
         onToggle={handleToggleLog}
         logs={activityLogs}
       />
-
-      {confirmDialog && (
-        <ConfirmDialog
-          title={confirmDialog.title}
-          body={confirmDialog.body}
-          confirmLabel={confirmDialog.confirmLabel}
-          cancelLabel={confirmDialog.cancelLabel}
-          tone={confirmDialog.tone}
-          focus={confirmDialog.focus}
-          outputBinding={shortcuts.output}
-          onConfirm={runConfirmDialog}
-          onCancel={cancelConfirmDialog}
-        />
-      )}
-
-      {!confirmDialog && recoverySession && (
-        <ConfirmDialog
-          title="Restore last session"
-          body={`The last session ended with ${itemCountLabel(recoverySession.items.length)} in the playlist${recoverySession.savedAt ? ` (saved ${new Date(recoverySession.savedAt).toLocaleString('en-US')})` : ''}. Load them into the empty playlist?`}
-          confirmLabel="Restore"
-          cancelLabel="Dismiss"
-          focus="confirm"
-          outputBinding={shortcuts.output}
-          onConfirm={handleRestoreSession}
-          onCancel={handleDismissSession}
-        />
-      )}
 
       {showNoteInput && (
         <div style={styles.modalOverlay}>
@@ -4074,7 +4228,7 @@ const App = () => {
         <div style={styles.modalOverlay} onKeyDown={(e) => {
           if (e.key === 'Escape') {
             setShowOBSEventModal(false)
-          } else if (e.key === 'Enter') {
+          } else if (e.key === 'Enter' && e.target.tagName !== 'BUTTON') {
             submitOBSEvent()
           }
         }}>
@@ -4592,7 +4746,8 @@ const App = () => {
                         style={styles.copyButton}
                         onClick={() => {
                           navigator.clipboard.writeText('http://localhost:8000/player')
-                          addLog('Local URL copied to clipboard', 'info')
+                            .then(() => flashSettingsFeedback('Copied'))
+                            .catch(() => flashSettingsFeedback('Not copied', 'error'))
                         }}
                       >
                         Copy
@@ -4646,7 +4801,8 @@ const App = () => {
                           style={styles.copyButton}
                           onClick={() => {
                             navigator.clipboard.writeText(networkInfo.player_url)
-                            addLog('Network URL copied to clipboard', 'info')
+                              .then(() => flashSettingsFeedback('Copied'))
+                              .catch(() => flashSettingsFeedback('Not copied', 'error'))
                           }}
                         >
                           Copy
@@ -4909,6 +5065,35 @@ const App = () => {
             </div>
           </div>
         </div>
+      )}
+
+      {confirmDialog && (
+        <ConfirmDialog
+          title={confirmDialog.title}
+          body={confirmDialog.body}
+          confirmLabel={confirmDialog.confirmLabel}
+          cancelLabel={confirmDialog.cancelLabel}
+          tone={confirmDialog.tone}
+          focus={confirmDialog.focus}
+          outputBinding={shortcuts.output}
+          onConfirm={runConfirmDialog}
+          onCancel={cancelConfirmDialog}
+        />
+      )}
+
+      {!confirmDialog && recoverySession && (
+        <ConfirmDialog
+          title={recoverySession.reason === 'engine-restart' ? 'Playout engine restarted' : 'Restore last session'}
+          body={recoverySession.reason === 'engine-restart'
+            ? `The playout engine stopped unexpectedly and restarted with an empty playlist. Load the ${itemCountLabel(recoverySession.items.length)} that ${recoverySession.items.length === 1 ? 'was' : 'were'} in it?`
+            : `The last session ended with ${itemCountLabel(recoverySession.items.length)} in the playlist${recoverySession.savedAt ? ` (saved ${new Date(recoverySession.savedAt).toLocaleString('en-US')})` : ''}. Load them into the empty playlist?`}
+          confirmLabel="Restore"
+          cancelLabel="Dismiss"
+          focus="confirm"
+          outputBinding={shortcuts.output}
+          onConfirm={handleRestoreSession}
+          onCancel={handleDismissSession}
+        />
       )}
     </div>
   )

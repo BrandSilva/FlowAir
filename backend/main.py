@@ -24,7 +24,7 @@ import time
 import psutil
 import socket
 
-from playlist_manager import PlaylistManager
+from playlist_manager import PlaylistManager, is_skipped_on_air
 from config import Config
 from obs_controller import OBSController
 
@@ -180,6 +180,8 @@ def handle_obs_event(item):
 playlist_manager.on_obs_event = handle_obs_event
 
 missing_file_timers = {}
+file_check_task = None
+LISTED_FILE_NAMES = 3
 last_broadcast_state = {"current_index": -1, "is_playing": False, "elapsed": 0}
 output_settings = {
     "resolution": "1920x1080",
@@ -217,6 +219,19 @@ def playlist_message(message_type="playlist_updated", **extra):
     message.update(extra)
     return message
 
+CUE_REFUSED_ERROR = "This item cannot be cued"
+
+def is_cue_target(item):
+    return item is not None and item.get("type") in ("video", "image") and not is_skipped_on_air(item)
+
+def cue_target_after(item_id):
+    playlist = playlist_manager.get_playlist()
+    index = next((idx for idx, item in enumerate(playlist) if item["id"] == item_id), -1)
+    for item in playlist[index + 1:] + playlist[:max(index, 0)]:
+        if is_cue_target(item):
+            return item
+    return None
+
 obs_settings = {
     "enabled": False,
     "host": "localhost",
@@ -235,7 +250,7 @@ async def update_playlist_times():
             await asyncio.sleep(0.5)
 
 async def refresh_playlist_state(check_counter):
-    global last_broadcast_state
+    global last_broadcast_state, file_check_task
 
     if not (playlist_manager.is_playing or playlist_manager.is_paused):
         await asyncio.sleep(0.5)
@@ -268,30 +283,55 @@ async def refresh_playlist_state(check_counter):
     check_counter += 1
     if check_counter >= 5:
         check_counter = 0
+        if file_check_task is None or file_check_task.done():
+            file_check_task = asyncio.create_task(check_files())
+
+    return check_counter
+
+def item_file_name(item):
+    return item.get("name") or os.path.basename(item.get("location") or "")
+
+def join_file_names(names):
+    if len(names) > LISTED_FILE_NAMES:
+        return f"{', '.join(names[:LISTED_FILE_NAMES])} and {len(names) - LISTED_FILE_NAMES} more"
+    if len(names) > 1:
+        return f"{', '.join(names[:-1])} and {names[-1]}"
+    return "".join(names)
+
+async def check_files():
+    try:
         file_state = await asyncio.to_thread(playlist_manager.check_missing_files)
-        missing_ids = file_state["missing"]
         current_time = datetime.now()
+        missing_ids = set(file_state["missing"])
+        rows = {item["id"]: item for item in playlist_manager.get_playlist()}
 
-        for item_id in missing_ids:
-            if item_id not in missing_file_timers:
-                missing_file_timers[item_id] = current_time
-                playlist_manager.mark_as_corrupted(item_id)
-                await broadcast_update(playlist_message("file_missing", item_id=item_id, message="File does not exist or was deleted"))
+        newly_missing = [item_id for item_id in file_state["missing"] if item_id not in missing_file_timers and item_id in rows]
+        for item_id in newly_missing:
+            missing_file_timers[item_id] = current_time
+            playlist_manager.mark_as_corrupted(item_id)
 
-        existing_ids = [item["id"] for item in playlist_manager.get_playlist()]
+        if newly_missing:
+            await broadcast_update(playlist_message(
+                "file_missing",
+                item_id=newly_missing[0],
+                item_ids=newly_missing,
+                message=join_file_names([item_file_name(rows[item_id]) for item_id in newly_missing])
+            ))
+
+        existing_ids = {item["id"] for item in playlist_manager.get_playlist()}
         restored = [timer_id for timer_id in missing_file_timers if timer_id not in missing_ids and timer_id in existing_ids]
 
         for timer_id in list(missing_file_timers.keys()):
             if timer_id not in missing_ids or timer_id not in existing_ids:
                 del missing_file_timers[timer_id]
 
-        for item_id in restored + file_state["changed"]:
-            if playlist_manager.mark_for_revalidation(item_id):
+        for item_id in dict.fromkeys(restored + file_state["changed"]):
+            if await asyncio.to_thread(playlist_manager.mark_for_revalidation, item_id):
                 await broadcast_update(item_issue_message(item_id))
 
         await check_stuck_validations(existing_ids, current_time)
-
-    return check_counter
+    except Exception:
+        pass
 
 async def check_stuck_validations(existing_ids, current_time):
     for item in playlist_manager.get_playlist():
@@ -402,6 +442,24 @@ def forget_connection(websocket):
         active_connections.remove(websocket)
     player_connections.discard(websocket)
 
+def is_local_client(websocket):
+    return websocket.client is not None and websocket.client.host in LOCAL_HOSTS
+
+closing_connections = set()
+
+async def close_connection(websocket):
+    try:
+        await websocket.close(code=1008)
+    except Exception:
+        pass
+
+def close_remote_connections():
+    for connection in [connection for connection in active_connections if not is_local_client(connection)]:
+        forget_connection(connection)
+        task = asyncio.create_task(close_connection(connection))
+        closing_connections.add(task)
+        task.add_done_callback(closing_connections.discard)
+
 async def relay_audio_level(level):
     if not active_connections:
         return
@@ -418,14 +476,15 @@ async def relay_audio_level(level):
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    active_connections.append(websocket)
-    is_player = websocket.query_params.get("role") == "player"
+    local = is_local_client(websocket)
+    is_player = (not local) or websocket.query_params.get("role") == "player"
     if is_player:
         player_connections.add(websocket)
+    active_connections.append(websocket)
     try:
         while True:
             raw = await websocket.receive_text()
-            if not is_player:
+            if not is_player or not local:
                 continue
             try:
                 incoming = json.loads(raw)
@@ -513,7 +572,7 @@ async def restore_items(request: RestoreItemsRequest):
 
 @app.post("/playlist/revalidate")
 async def revalidate_item(request: RemoveItemRequest):
-    success = playlist_manager.mark_for_revalidation(request.item_id)
+    success = await asyncio.to_thread(playlist_manager.mark_for_revalidation, request.item_id)
     if success:
         await broadcast_update(item_issue_message(request.item_id))
     return {"success": success}
@@ -569,8 +628,21 @@ async def clear_playlist():
 
 @app.post("/playlist/remove")
 async def remove_item(request: RemoveItemRequest):
+    current = playlist_manager.get_current_item()
+    if current is None or current["id"] != request.item_id:
+        playlist_manager.remove_item(request.item_id)
+        await broadcast_update(playlist_message())
+        return {"success": True}
+
+    if playlist_manager.is_playing:
+        return {"success": False, "error": "The item on air cannot be removed"}
+
+    target = cue_target_after(request.item_id)
     playlist_manager.remove_item(request.item_id)
-    await broadcast_update(playlist_message())
+    if target is not None:
+        playlist_manager.cue(target["id"])
+    playlist_manager.recalculate_start_times()
+    await broadcast_update(playlist_message("item_cued" if target is not None else "playlist_updated"))
     return {"success": True}
 
 @app.post("/playlist/check-file")
@@ -594,16 +666,20 @@ async def move_items(request: MoveItemsRequest):
     await broadcast_update(playlist_message())
     return {"success": success}
 
-@app.post("/player/play")
-async def play():
-    playlist_manager.play()
+async def broadcast_playback_state():
     await broadcast_update({
         "type": "playback_state_changed",
-        "is_playing": True,
+        "is_playing": bool(playlist_manager.is_playing),
         "current_item": playlist_manager.get_current_item(),
         "next_item": playlist_manager.get_next_playable_item()
     })
-    return {"success": True}
+
+@app.post("/player/play")
+async def play():
+    playlist_manager.play()
+    if main_event_loop:
+        asyncio.run_coroutine_threadsafe(broadcast_playback_state(), main_event_loop)
+    return {"success": True, "is_playing": bool(playlist_manager.is_playing)}
 
 @app.post("/player/stop")
 async def stop():
@@ -657,7 +733,12 @@ async def player_volume(request: VolumeRequest):
 
 @app.post("/player/cue")
 async def cue_item(request: CueRequest):
+    if not is_cue_target(find_playlist_item(request.item_id)):
+        return {"success": False, "error": CUE_REFUSED_ERROR}
     playlist_manager.cue(request.item_id)
+    current = playlist_manager.get_current_item()
+    if current is None or current["id"] != request.item_id:
+        return {"success": False, "error": CUE_REFUSED_ERROR}
     playlist_manager.recalculate_start_times()
     await broadcast_update(playlist_message("item_cued"))
     return {"success": True}
@@ -695,6 +776,8 @@ async def get_output_settings():
 async def update_output_settings(settings: dict):
     global output_settings
     output_settings.update(settings)
+    if not output_settings.get("networkStreamingEnabled"):
+        close_remote_connections()
     await broadcast_update({
         "type": "output_settings_changed",
         "aspectRatio": output_settings.get("aspectRatio", "16:9"),
@@ -794,7 +877,7 @@ def obs_status():
 def obs_scenes():
     return {"scenes": obs_controller.get_scenes()}
 
-@app.get("/obs/scenes/{scene_name}/sources")
+@app.get("/obs/scenes/{scene_name:path}/sources")
 def obs_scene_sources(scene_name: str):
     return {"sources": obs_controller.get_scene_sources(scene_name)}
 
@@ -966,11 +1049,12 @@ async def player_page():
             let standbyItemId = null;
             let standbyReady = false;
             let currentVolume = 100;
+            let autoplayMuted = false;
 
             function applyMuteState() {
                 standby.muted = true;
                 if (!isMuted) {
-                    video.muted = false;
+                    video.muted = autoplayMuted;
                     return;
                 }
                 video.muted = !(meterStarted && analyserNode);
@@ -990,6 +1074,7 @@ async def player_page():
             let reportedItemId = null;
             let revealed = false;
             let lastHardSeekAt = 0;
+            let loadGeneration = 0;
             let desiredSinkLabel = '';
             let sinkTimer = null;
             let ws = null;
@@ -1120,7 +1205,6 @@ async def player_page():
 
             function applyVolume(v) {
                 if (typeof v === 'number') currentVolume = v;
-                if (isMuted) return;
                 const level = Math.max(0, Math.min(1, currentVolume / 100));
                 video.volume = level;
                 standby.volume = level;
@@ -1209,7 +1293,9 @@ async def player_page():
                         c.style.height = '100vh';
                     }
                 }
-                video.style.objectFit = objectFit;
+                mediaElements.forEach(function (element) {
+                    element.style.objectFit = objectFit;
+                });
                 image.style.objectFit = objectFit;
             }
 
@@ -1256,6 +1342,14 @@ async def player_page():
                 }
             }
 
+            function unmuteOnGesture() {
+                document.removeEventListener('pointerup', unmuteOnGesture);
+                document.removeEventListener('keydown', unmuteOnGesture);
+                autoplayMuted = false;
+                applyMuteState();
+                attemptPlay();
+            }
+
             function attemptPlay() {
                 clearPlayRetry();
                 if (!wantsPlay || currentItemType !== 'video') return;
@@ -1269,12 +1363,21 @@ async def player_page():
                 promise.then(function () {
                     playAttempts = 0;
                 }).catch(function (error) {
-                    playAttempts++;
                     const name = error && error.name ? error.name : '';
                     if (name === 'NotSupportedError' || isFatalMediaError()) {
                         reportPlaybackError('decode_failed', 'The player could not decode this file', true);
                         return;
                     }
+                    if (name === 'NotAllowedError' && !isMuted && !isOutput) {
+                        if (autoplayMuted) return;
+                        autoplayMuted = true;
+                        applyMuteState();
+                        document.addEventListener('pointerup', unmuteOnGesture);
+                        document.addEventListener('keydown', unmuteOnGesture);
+                        attemptPlay();
+                        return;
+                    }
+                    playAttempts++;
                     if (playAttempts <= 40) {
                         playRetryTimer = setTimeout(attemptPlay, Math.min(1500, 150 * playAttempts));
                     } else {
@@ -1311,6 +1414,8 @@ async def player_page():
                 const previous = video;
                 video = standby;
                 standby = previous;
+                video.style.transition = 'none';
+                standby.style.transition = 'none';
 
                 standbyItemId = null;
                 standbyReady = false;
@@ -1320,8 +1425,10 @@ async def player_page():
                 standby.removeAttribute('src');
                 standby.load();
 
+                loadGeneration++;
                 currentItemId = item.id;
                 currentItemType = item.type;
+                video.loop = !!item.loop;
                 wantsPlay = !!shouldPlay;
                 pendingStartAt = 0;
                 playAttempts = 0;
@@ -1340,6 +1447,9 @@ async def player_page():
                 revealed = false;
                 image.style.display = 'none';
                 revealVideo();
+                void video.offsetWidth;
+                video.style.transition = '';
+                standby.style.transition = '';
                 attemptPlay();
             }
 
@@ -1350,8 +1460,10 @@ async def player_page():
                     swapToStandby(item, shouldPlay);
                     return;
                 }
+                loadGeneration++;
                 currentItemId = item.id;
                 currentItemType = item.type;
+                video.loop = !!item.loop;
                 wantsPlay = !!shouldPlay;
                 pendingStartAt = startAt || 0;
                 playAttempts = 0;
@@ -1393,6 +1505,7 @@ async def player_page():
                 loadStartedAt = clock();
                 lastProgressAt = clock();
                 revealed = false;
+                pendingStartAt = Math.max(pendingStartAt, video.currentTime || 0);
                 video.src = baseURL + '/stream/' + currentItemId + '?retry=' + loadAttempts;
                 video.load();
             }
@@ -1402,6 +1515,7 @@ async def player_page():
                 stopMeter();
                 wantsPlay = false;
                 loadPending = false;
+                loadGeneration++;
                 currentItemId = null;
                 currentItemType = null;
                 revealed = false;
@@ -1492,7 +1606,7 @@ async def player_page():
                 reportPlaybackError('image_failed', 'The image could not be displayed', true);
             });
 
-            function handlePlaybackState(data) {
+            function applyEngineSettings(data) {
                 if (typeof data.volume === 'number') {
                     applyVolume(data.volume);
                 }
@@ -1503,10 +1617,24 @@ async def player_page():
                     desiredSinkLabel = data.audioDeviceLabel;
                     applySink();
                 }
+            }
+
+            function isMediaItem(item) {
+                return !!item && (item.type === 'video' || item.type === 'image');
+            }
+
+            function handlePlaybackState(data) {
+                applyEngineSettings(data);
 
                 const item = data.current_item;
                 if (!item) {
                     if (currentItemId !== null) clearMedia();
+                    return;
+                }
+
+                if (!isMediaItem(item)) {
+                    wantsPlay = false;
+                    if (!video.paused) video.pause();
                     return;
                 }
 
@@ -1538,9 +1666,14 @@ async def player_page():
 
                 ws.onopen = () => {
                     reconnectAttempts = 0;
+                    const generation = loadGeneration;
                     fetch(baseURL + '/player/state')
                         .then(res => res.json())
                         .then(data => {
+                            if (generation !== loadGeneration) {
+                                applyEngineSettings(data);
+                                return;
+                            }
                             handlePlaybackState(data);
                         })
                         .catch(() => {});
@@ -1555,6 +1688,7 @@ async def player_page():
                     }
 
                     if (data.type === 'playback_state_changed') {
+                        loadGeneration++;
                         handlePlaybackState(data);
                     } else if (data.type === 'output_settings_changed') {
                         applyOutputSettings(data.aspectRatio, data.scalingMode);
@@ -1565,6 +1699,7 @@ async def player_page():
                     } else if (data.type === 'volume_changed') {
                         applyVolume(data.volume);
                     } else if (data.type === 'player_seek') {
+                        loadGeneration++;
                         const item = data.current_item;
                         if (item && item.id === currentItemId && item.type === 'video' && !loadPending) {
                             try {
@@ -1577,7 +1712,7 @@ async def player_page():
                         }
                     } else if (data.type === 'item_cued') {
                         const item = data.current_item;
-                        if (item) {
+                        if (isMediaItem(item)) {
                             startLoad(item, 0, false);
                         }
                     }
@@ -1627,9 +1762,13 @@ async def player_page():
                     return;
                 }
 
+                const generation = loadGeneration;
                 fetch(baseURL + '/player/state')
                     .then(res => res.json())
                     .then(data => {
+                        if (generation !== loadGeneration) {
+                            return;
+                        }
                         if (!data.current_item || data.current_item.type !== 'video') {
                             return;
                         }
@@ -1637,6 +1776,7 @@ async def player_page():
                             handlePlaybackState(data);
                             return;
                         }
+                        video.loop = !!data.current_item.loop;
                         preloadNext(data.next_item, remainingSeconds(data.current_item, data.elapsed));
                         if (!data.is_playing) {
                             return;

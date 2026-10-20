@@ -24,6 +24,7 @@ const UPDATE_CHECK_DELAY_MS = 20000
 const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
 const UPDATE_REQUEST_TIMEOUT_MS = 15000
 const WINDOW_SHOW_FALLBACK_MS = 8000
+const OUTPUT_RETURN_DELAY_MS = 2000
 const UPDATE_RETRY_DELAYS_MS = [120000, 600000, 1800000]
 const UPDATE_STALL_TIMEOUT_MS = 30000
 const UPDATE_PROGRESS_INTERVAL_MS = 500
@@ -51,7 +52,7 @@ const AUDIO_DEVICES_SCRIPT = `(async () => {
   }
   return devices
 })()`
-const ALLOWED_PERMISSIONS = ['media', 'audioCapture', 'speaker-selection']
+const ALLOWED_PERMISSIONS = ['media', 'audioCapture', 'speaker-selection', 'clipboard-sanitized-write']
 const TASKKILL_PATH = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe')
 const WINDOWS_PATH_PATTERN = /^(?:[A-Za-z]:[\\/]|[\\/]{2}[^<>:"|?*\\/\u0000-\u001f]+[\\/][^<>:"|?*\\/\u0000-\u001f]+)[^<>:"|?*\u0000-\u001f]*$/
 const WINDOWS_DEVICE_PATTERN = /^[\\/]{2}[.?][\\/]/
@@ -110,7 +111,7 @@ const ACCELERATOR_MESSAGES = {
 }
 const PLAYLIST_EXTENSION = '.flowair'
 const PLAYLIST_FILE_LIMIT = 16 * 1024 * 1024
-const PLAYLIST_FILE_DELIVERY_MS = 300
+const PLAYLIST_FILE_DELIVERY_MS = 5000
 const PLAYLIST_FILE_QUEUE_LIMIT = 8
 const DIAGNOSTICS_GPU_TIMEOUT_MS = 2500
 const DIAGNOSTICS_GPU_VENDORS = { 4098: 'AMD', 4318: 'NVIDIA', 5140: 'Microsoft', 32902: 'Intel' }
@@ -146,12 +147,14 @@ let backendSpawnError = null
 let backendInstance = ''
 let backendStarted = false
 let backendRestartTimes = []
+let backendRestartPending = false
+let heldAutosave = null
 let isQuitting = false
 let interfaceLoaded = false
 let availableUpdate = null
 let powerSaveBlockerId = null
 let updateSettings = null
-let updateState = { status: 'idle', version: '', notes: '', url: RELEASES_PAGE_URL, downloaded: false, progress: 0, error: '', enabled: true }
+let updateState = { status: 'idle', version: '', notes: '', url: RELEASES_PAGE_URL, downloaded: false, progress: 0, error: '', enabled: true, checkedAt: 0, checkFailed: false }
 let updateAsset = null
 let updateDownload = null
 let updateInstallerPath = ''
@@ -159,9 +162,12 @@ let updateCheckTimer = null
 let updateRetryTimer = null
 let updateRetryIndex = 0
 let updateCheckInterval = null
+let updateCheckRunning = false
 let emergencyShortcutActive = false
 let outputAccelerator = DEFAULT_OUTPUT_ACCELERATOR
 let outputReopenDisplayId = null
+let outputReturnDisplayId = null
+let outputReturnTimer = null
 let pendingPlaylistFiles = []
 let rendererReady = false
 let rendererLoadToken = 0
@@ -320,6 +326,7 @@ function startBackendProcess() {
     if (backendProcess !== child) return
     backendProcess = null
     if (backendStarted && !isQuitting) {
+      if (!backendRestartPending) heldAutosave = readAutosave()
       scheduleBackendRestart()
     }
   })
@@ -331,7 +338,7 @@ async function waitForBackend(child) {
   while (Date.now() < deadline) {
     if (backendSpawnError || child.exitCode !== null) return false
     const probe = await probeBackend(1000)
-    if (probe.state === 'flowair' && probe.instance === backendInstance) {
+    if (probe.state === 'flowair' && probe.instance === backendInstance && child.exitCode === null) {
       backendVersion = probe.version || ''
       return true
     }
@@ -367,7 +374,13 @@ async function launchBackend() {
     return { ok: false, reason: 'port-in-use' }
   }
 
-  const child = startBackendProcess()
+  let child = null
+  try {
+    child = startBackendProcess()
+  } catch (error) {
+    backendSpawnError = error
+    return { ok: false, reason: 'spawn-failed', detail: error.message }
+  }
   if (await waitForBackend(child)) return { ok: true }
 
   const result = {
@@ -380,6 +393,7 @@ async function launchBackend() {
 }
 
 function scheduleBackendRestart() {
+  if (backendRestartPending) return
   const now = Date.now()
   backendRestartTimes = backendRestartTimes.filter(time => now - time < BACKEND_RESTART_WINDOW_MS)
   if (backendRestartTimes.length >= BACKEND_RESTART_LIMIT) {
@@ -390,13 +404,20 @@ function scheduleBackendRestart() {
     return
   }
   backendRestartTimes.push(now)
+  backendRestartPending = true
 
   setTimeout(async () => {
-    if (isQuitting) return
+    if (isQuitting) {
+      backendRestartPending = false
+      return
+    }
     const result = await launchBackend()
+    backendRestartPending = false
     if (isQuitting) return
     if (result.ok) {
-      sendToMain('backend-restarted')
+      const autosave = heldAutosave
+      heldAutosave = null
+      sendToMain('backend-restarted', { autosave })
     } else {
       scheduleBackendRestart()
     }
@@ -589,6 +610,7 @@ function createOutputWindow(targetDisplay) {
     skipTaskbar: true,
     alwaysOnTop: true,
     kiosk: false,
+    minimizable: false,
     backgroundColor: '#000000',
     webPreferences: {
       nodeIntegration: false,
@@ -628,19 +650,52 @@ function createOutputWindow(targetDisplay) {
   window.webContents.on('render-process-gone', () => {
     if (!window.isDestroyed()) window.loadURL(OUTPUT_PLAYER_URL)
   })
+  window.on('minimize', () => {
+    if (!window.isDestroyed()) window.showInactive()
+  })
   window.on('closed', () => {
     if (retryTimer) {
       clearTimeout(retryTimer)
       retryTimer = null
     }
-    if (outputWindow === window) {
-      outputWindow = null
-      outputDisplayId = null
+    if (outputWindow !== window) return
+    const displayId = outputDisplayId
+    outputWindow = null
+    outputDisplayId = null
+    if (isQuitting) {
       setEmergencyExitShortcut(false)
+      return
     }
+    outputReopenDisplayId = displayId
+    setEmergencyExitShortcut(true)
+    sendToMain('output-window-closed', { reason: 'closed' })
   })
 
   window.loadURL(OUTPUT_PLAYER_URL)
+}
+
+function cancelOutputReturn() {
+  outputReturnDisplayId = null
+  if (outputReturnTimer) {
+    clearTimeout(outputReturnTimer)
+    outputReturnTimer = null
+  }
+}
+
+function returnOutputWindow(displayId) {
+  outputReturnTimer = null
+  if (isQuitting || isCreatingOutputWindow || displayId !== outputReturnDisplayId) return
+  if ((outputWindow && !outputWindow.isDestroyed()) || !mainWindow || mainWindow.isDestroyed()) return
+  if (!screen.getAllDisplays().some(display => display.id === displayId)) return
+  if (screen.getDisplayMatching(mainWindow.getNormalBounds()).id === displayId) return
+  outputReturnDisplayId = null
+  openOutputWindow(displayId)
+  sendToMain('output-window-opened', { displayId, reason: 'display-returned' })
+}
+
+function scheduleOutputReturn(displayId) {
+  if (outputReturnTimer) clearTimeout(outputReturnTimer)
+  outputReturnTimer = setTimeout(() => returnOutputWindow(displayId), OUTPUT_RETURN_DELAY_MS)
 }
 
 function watchDisplays() {
@@ -648,14 +703,20 @@ function watchDisplays() {
     if (display.id === outputReopenDisplayId) outputReopenDisplayId = null
     if (outputWindow && display.id === outputDisplayId) {
       closeOutputWindow()
+      cancelOutputReturn()
+      outputReturnDisplayId = display.id
       sendToMain('output-window-closed', { reason: 'display-removed' })
     }
     sendToMain('displays-changed')
   })
-  screen.on('display-added', () => sendToMain('displays-changed'))
+  screen.on('display-added', (event, display) => {
+    if (display && display.id === outputReturnDisplayId) scheduleOutputReturn(display.id)
+    sendToMain('displays-changed')
+  })
 }
 
 function toggleOutputWindow() {
+  cancelOutputReturn()
   if (outputWindow && !outputWindow.isDestroyed()) {
     const displayId = outputDisplayId
     closeOutputWindow()
@@ -952,25 +1013,43 @@ function requestRelease(url) {
 }
 
 function scheduleUpdateRetry() {
+  if (updateRetryTimer) {
+    clearTimeout(updateRetryTimer)
+    updateRetryTimer = null
+  }
   if (!app.isPackaged || !readUpdateSettings().enabled) return
-  if (updateRetryTimer) clearTimeout(updateRetryTimer)
-  const delay = UPDATE_RETRY_DELAYS_MS[Math.min(updateRetryIndex, UPDATE_RETRY_DELAYS_MS.length - 1)]
+  if (updateRetryIndex >= UPDATE_RETRY_DELAYS_MS.length) return
+  updateRetryTimer = setTimeout(checkForUpdates, UPDATE_RETRY_DELAYS_MS[updateRetryIndex])
   updateRetryIndex += 1
-  updateRetryTimer = setTimeout(checkForUpdates, delay)
 }
 
-async function checkForUpdates() {
+async function checkForUpdates(manual) {
+  if (updateCheckRunning) return
   const settings = readUpdateSettings()
   if (!settings.enabled || updateDownload || updateState.status === 'installing') return
-  const release = await fetchLatestRelease()
+  updateCheckRunning = true
+  let release = null
+  try {
+    release = await fetchLatestRelease()
+  } catch (error) {
+    release = null
+  } finally {
+    updateCheckRunning = false
+  }
+  if (!settings.enabled || updateDownload || updateState.status === 'downloading' || updateState.status === 'installing') return
   if (!release) {
-    scheduleUpdateRetry()
+    setUpdateState({ checkFailed: true })
+    if (manual !== true) scheduleUpdateRetry()
     return
   }
   updateRetryIndex = 0
+  setUpdateState({ checkFailed: false, checkedAt: Date.now() })
   if (!isNewerVersion(release.version, app.getVersion())) return
   if (settings.dismissed.includes(release.version)) return
-  if (updateState.status === 'ready' && updateState.version === release.version) return
+  if (updateState.status === 'ready' && updateState.version === release.version) {
+    updateAsset = release.asset
+    return
+  }
   if (settings.downloadedVersion && settings.downloadedVersion !== release.version) {
     forgetDownloadedUpdate(settings, true)
     clearUpdateDirectory(null)
@@ -1041,7 +1120,10 @@ function clearUpdateDirectory(keepName) {
 
 function restoreDownloadedUpdate() {
   const settings = readUpdateSettings()
-  if (!settings.downloadedVersion) return
+  if (!settings.downloadedVersion) {
+    if (!updateDownload && updateState.status !== 'downloading') clearUpdateDirectory(null)
+    return
+  }
   const usable = isNewerVersion(settings.downloadedVersion, app.getVersion()) &&
     !settings.dismissed.includes(settings.downloadedVersion) &&
     fileMatches(settings.downloadedPath, settings.downloadedSize)
@@ -1254,6 +1336,7 @@ function beginUpdateDownload() {
     hash: expectedDigest ? crypto.createHash('sha256') : null
   }
   updateDownload = download
+  armStallTimer(download)
   setUpdateState({ status: 'downloading', progress: 0, downloaded: false, error: '' })
 
   file.on('error', () => failDownload(download, 'The update could not be saved to disk.'))
@@ -1338,6 +1421,7 @@ function setUpdatesEnabled(enabled) {
     return
   }
   restoreDownloadedUpdate()
+  updateRetryIndex = 0
   emitUpdateState()
   scheduleUpdateChecks(1000)
 }
@@ -1614,21 +1698,16 @@ async function installUpdate(force) {
   sendToMain('update-installing', { version: updateState.version })
   clearUpdateTimers()
 
-  isQuitting = true
-  closeOutputWindow()
-  stopBackend()
-  await waitForPortRelease(10000)
-
   const failure = await shell.openPath(installerPath)
   if (failure) {
-    isQuitting = false
-    setUpdateState({ status: 'ready', error: 'The installer could not be started. Open FlowAir-Setup.exe from the updates folder.' })
+    setUpdateState({ status: 'ready', error: `The installer could not be started. Click Install now to try again, or run ${installerPath}` })
     sendToMain('update-failed', { error: 'The installer could not be started.' })
-    const relaunch = await launchBackend()
-    if (relaunch.ok) sendToMain('backend-restarted')
     scheduleUpdateChecks(UPDATE_CHECK_INTERVAL_MS)
     return { success: false, reason: 'launch-failed' }
   }
+  isQuitting = true
+  closeOutputWindow()
+  stopBackend()
   setTimeout(() => app.quit(), INSTALL_QUIT_DELAY_MS)
   return { success: true }
 }
@@ -1725,6 +1804,15 @@ async function revealInExplorer(value) {
 
 function autosavePath() {
   return path.join(app.getPath('userData'), 'autosave.flowair')
+}
+
+function readAutosave() {
+  try {
+    const data = JSON.parse(fs.readFileSync(autosavePath(), 'utf-8'))
+    return data && Array.isArray(data.items) ? data : null
+  } catch (error) {
+    return null
+  }
 }
 
 function playlistPathShape(value, baseDirectory) {
@@ -1886,10 +1974,12 @@ function registerIpcHandlers() {
   })
 
   ipcMain.on('open-output-window', (event, displayId) => {
+    cancelOutputReturn()
     openOutputWindow(displayId)
   })
 
   ipcMain.on('close-output-window', () => {
+    cancelOutputReturn()
     outputReopenDisplayId = null
     closeOutputWindow()
     isCreatingOutputWindow = false
@@ -1912,6 +2002,11 @@ function registerIpcHandlers() {
   })
 
   ipcMain.handle('update:get-state', () => updateStateSnapshot())
+
+  ipcMain.handle('update:check-now', async () => {
+    if (app.isPackaged && readUpdateSettings().enabled) await checkForUpdates(true)
+    return updateStateSnapshot()
+  })
 
   ipcMain.handle('update:download', () => {
     beginUpdateDownload()
@@ -1949,14 +2044,7 @@ function registerIpcHandlers() {
     return copyDiagnostics()
   })
 
-  ipcMain.handle('read-autosave', () => {
-    try {
-      const data = JSON.parse(fs.readFileSync(autosavePath(), 'utf-8'))
-      return data && Array.isArray(data.items) ? data : null
-    } catch (error) {
-      return null
-    }
-  })
+  ipcMain.handle('read-autosave', () => readAutosave())
 
   ipcMain.on('write-autosave', (event, items) => {
     try {
@@ -2018,6 +2106,7 @@ if (!app.requestSingleInstanceLock()) {
 
   app.on('before-quit', () => {
     isQuitting = true
+    cancelOutputReturn()
   })
 
   app.on('window-all-closed', () => {

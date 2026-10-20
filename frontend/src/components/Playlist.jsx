@@ -122,6 +122,15 @@ const canStartConversion = (item) => {
   return !!conversion && !ACTIVE_CONVERSION.includes(conversion.status) && conversion.status !== 'done'
 }
 
+const cueBlockReason = (item) => {
+  const conversion = item.conversion
+  const converting = !!(conversion && typeof conversion === 'object' && ACTIVE_CONVERSION.includes(conversion.status))
+  if (item.playability === 'preparing' || converting) return 'This item cannot be cued: it is being prepared'
+  if (item.status === 'corrupted' || item.playability === 'unsupported') return 'This item cannot be cued: it is unplayable'
+  if (item.type !== 'video' && item.type !== 'image') return 'This item cannot be cued: it is not a video or image'
+  return ''
+}
+
 const describeWork = (item, conversion) => {
   if (conversion.plan === 'remux') return 'Copying the picture and sound into an MP4 file (no re-encoding)'
   if (conversion.plan === 'audio') {
@@ -202,7 +211,8 @@ const rowPropsEqual = (prev, next) => {
     a.obs_action === b.obs_action &&
     a.obs_scene === b.obs_scene &&
     a.obs_source === b.obs_source &&
-    a.obs_transition === b.obs_transition
+    a.obs_transition === b.obs_transition &&
+    a.obs_transition_duration === b.obs_transition_duration
   )
 }
 
@@ -240,6 +250,7 @@ const PlaylistRow = React.memo(({
   const conversion = isSpecial ? null : conversionOf(item)
   const conversionText = isSpecial ? '' : conversionTitle(item)
   const issues = preparing ? conversionText : joinTitles(issueTitle(item), conversionText)
+  const cueBlocked = isSpecial ? '' : cueBlockReason(item)
 
   const setRef = useCallback((el) => registerRow(item.id, el), [registerRow, item.id])
   const handleSelect = useCallback((e) => onSelect(e, index), [onSelect, index])
@@ -319,7 +330,8 @@ const PlaylistRow = React.memo(({
               <button
                 className="pl-act"
                 onClick={(e) => { dropFocus(e); e.stopPropagation(); onCue(item.id) }}
-                title="Cue this item"
+                disabled={!!cueBlocked}
+                title={cueBlocked || 'Cue this item'}
               >
                 CUE
               </button>

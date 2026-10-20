@@ -512,7 +512,9 @@ class MediaConverter:
             needed = 0
         if job.plan == "full":
             duration = _safe_float(job.info.get("duration")) or 0
-            needed = max(needed, int(duration * MAX_VIDEO_BITRATE / 8))
+            if duration > 0:
+                bound = int(duration * MAX_VIDEO_BITRATE / 8)
+                needed = max(bound, min(needed, int(bound * 1.5)))
         referenced = self._referenced()
         with self.lock:
             busy = set(self.jobs.keys())

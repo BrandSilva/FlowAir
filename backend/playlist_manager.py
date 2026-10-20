@@ -13,6 +13,10 @@ def is_skipped_on_air(item):
     return item.get("status") == "corrupted" or item.get("playability") in SKIPPED_PLAYABILITY
 
 
+def is_airable(item):
+    return item.get("type") in ("video", "image") and not is_skipped_on_air(item)
+
+
 def empty_conversion(plan="none"):
     return {"plan": plan, "status": "none", "progress": 0, "encoder": "", "error": ""}
 
@@ -251,6 +255,8 @@ class PlaylistManager:
         self.playlist.insert(insert_index, item)
 
     def _validate_item_async(self, item):
+        if self._find_item(item["id"]) is not item:
+            return
         filepath = item["location"]
         deadline = time.monotonic() + 30.0
 
@@ -271,26 +277,11 @@ class PlaylistManager:
 
     def _evict_cache_entries(self, filepath):
         prefix = f"{filepath}|"
-        for key in [k for k in self.validation_cache if k.startswith(prefix)]:
-            del self.validation_cache[key]
+        for key in [k for k in list(self.validation_cache) if k.startswith(prefix)]:
+            self.validation_cache.pop(key, None)
 
     def _probe_file(self, filepath):
-        probe = getattr(self.validator, "probe", None)
-        if probe is not None:
-            return probe(filepath)
-
-        validation = self.validator.validate_file(filepath)
-        return {
-            "type": validation["type"],
-            "valid": validation["valid"],
-            "duration": validation["duration"],
-            "resolution": validation["resolution"],
-            "file_size": self.validator.get_file_size(filepath),
-            "format": self.validator.get_codec_info(filepath),
-            "bitrate": self.validator.get_bitrate(filepath) if validation["type"] == "video" else None,
-            "playability": "ok",
-            "issues": []
-        }
+        return self.validator.probe(filepath)
 
     def _apply_result(self, item, result):
         item["type"] = result.get("type", "video")
@@ -322,15 +313,14 @@ class PlaylistManager:
                     self.validator.get_video_duration_formatted(result.get("duration"))
                     if result.get("type") == "video" else "STATIC"
                 )
-                if "file_size" not in result:
-                    result["file_size"] = self.validator.get_file_size(filepath)
                 self._apply_result(item, result)
                 if signature:
                     self._evict_cache_entries(filepath)
                     self.validation_cache[key] = result
 
             item["file_signature"] = signature
-            self._plan_conversion(item, result, signature)
+            if self._find_item(item["id"]) is item:
+                self._plan_conversion(item, result, signature)
         except Exception:
             item["status"] = "corrupted"
             item["duration_formatted"] = "ERROR"
@@ -351,6 +341,15 @@ class PlaylistManager:
         self._bump_revision()
         self.last_validation_at = time.monotonic()
         self.validation_completed = True
+
+    def _refresh_schedule(self):
+        try:
+            if self.is_playing:
+                self.absolute_schedule = {}
+                self._calculate_absolute_schedule()
+            self.recalculate_start_times()
+        except Exception:
+            pass
 
     def _find_item(self, item_id):
         for item in list(self.playlist):
@@ -448,13 +447,18 @@ class PlaylistManager:
 
     def _on_conversion_update(self, key, state, item_ids, final):
         changed = []
+        flipped = False
         for item in list(self.playlist):
             if item["id"] in item_ids and self.conversion_keys.get(item["id"]) == key:
+                skipped = is_skipped_on_air(item)
                 self._apply_conversion_state(item, state)
+                flipped = flipped or skipped != is_skipped_on_air(item)
                 changed.append(item["id"])
         if not changed:
             return
         self._bump_revision()
+        if flipped:
+            self._refresh_schedule()
         if self.on_conversion_change:
             self.on_conversion_change(changed, final)
 
@@ -478,6 +482,7 @@ class PlaylistManager:
             started.append(item["id"])
         if started:
             self._bump_revision()
+            self._refresh_schedule()
             if self.on_conversion_change:
                 self.on_conversion_change(started, False)
         return started
@@ -503,6 +508,7 @@ class PlaylistManager:
             if other["id"] in sharing:
                 self._apply_conversion_state(other, state)
         self._bump_revision()
+        self._refresh_schedule()
         return True, None
 
     def cancel_conversion(self, item_id):
@@ -766,8 +772,15 @@ class PlaylistManager:
             self.current_index = 0
 
         current_item = self.get_current_item()
-        if current_item and (current_item.get("status") == "corrupted" or current_item.get("playability") in SKIPPED_PLAYABILITY):
+        if current_item is None:
+            return
+        if not is_airable(current_item):
+            was_playing = self.is_playing
             self.next()
+            current_item = self.get_current_item()
+            if was_playing or not current_item or not is_airable(current_item):
+                return
+        elif self.is_playing:
             return
 
         if self.is_paused and self.pause_time:
@@ -852,7 +865,9 @@ class PlaylistManager:
             self.scheduled_item_id = None
 
             now = datetime.now()
-            if self.last_next_time and (now - self.last_next_time).total_seconds() < 0.2:
+            current = self.get_current_item()
+            debounced = self.last_next_time and (now - self.last_next_time).total_seconds() < 0.2
+            if debounced and (current is None or not is_skipped_on_air(current)):
                 return
 
             self.last_next_time = now
@@ -861,7 +876,7 @@ class PlaylistManager:
             if self.current_index >= 0 and self.current_index < len(self.playlist):
                 current_item = self.playlist[self.current_index]
 
-                if not from_force_timing and current_item.get("loop", False) and current_item["type"] == "video":
+                if not from_force_timing and current_item.get("loop", False) and current_item["type"] == "video" and not is_skipped_on_air(current_item):
                     self.current_video_start_time = datetime.now()
                     self.current_video_elapsed = 0
                     self.total_pause_time = 0
@@ -870,8 +885,10 @@ class PlaylistManager:
                     self.recalculate_start_times()
                     return
 
+            start_index = self.current_index
             while True:
                 if self.current_index >= len(self.playlist) - 1:
+                    self.current_index = start_index
                     self.stop()
                     self.recalculate_start_times()
                     self._notify_playback_state()
@@ -881,7 +898,7 @@ class PlaylistManager:
                 next_item = self.playlist[self.current_index]
 
                 if next_item["type"] == "stop":
-                    self.current_index -= 1
+                    self.current_index = start_index
                     self.stop()
                     self.recalculate_start_times()
                     self._notify_playback_state()
@@ -987,6 +1004,7 @@ class PlaylistManager:
                 if item.get("location"):
                     self._evict_cache_entries(item["location"])
                 self._bump_revision()
+                self._refresh_schedule()
                 break
 
     def mark_for_revalidation(self, item_id):
@@ -1001,7 +1019,8 @@ class PlaylistManager:
                     item["playability"] = "preparing"
                 else:
                     item["playability"] = "ok"
-                    item["conversion"] = empty_conversion()
+                    if conversion.get("status") != "done" or self.file_signature(item["location"]) != item.get("file_signature"):
+                        item["conversion"] = empty_conversion()
                 self._bump_revision()
                 self.validation_executor.submit(self._validate_item_async, item)
                 return True
@@ -1020,7 +1039,8 @@ class PlaylistManager:
                 })
                 item["issues"] = issues
 
-                if fatal:
+                escalated = fatal and item.get("playability") not in SKIPPED_PLAYABILITY
+                if escalated:
                     item["status"] = "corrupted"
                     item["playability"] = "unsupported"
                     if item.get("location"):
@@ -1029,6 +1049,8 @@ class PlaylistManager:
                     item["playability"] = "warn"
 
                 self._bump_revision()
+                if escalated:
+                    self._refresh_schedule()
                 return item
         return None
 

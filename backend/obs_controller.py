@@ -58,6 +58,19 @@ class OBSController:
                 self.client = None
                 return {"success": False, "error": str(e)}
 
+    def _close_client(self):
+        try:
+            self.client.disconnect()
+        except Exception:
+            pass
+        self.client = None
+        self.connected = False
+
+    def _drop_client_unless_answered(self, error):
+        from obsws_python.error import OBSSDKRequestError
+        if not isinstance(error, OBSSDKRequestError):
+            self._close_client()
+
     def is_alive(self):
         with self.lock:
             if not self.client:
@@ -67,9 +80,8 @@ class OBSController:
                 self.client.get_version()
                 self.connected = True
                 return True
-            except:
-                self.connected = False
-                self.client = None
+            except Exception:
+                self._close_client()
                 return False
 
     def get_scenes(self):
@@ -94,7 +106,8 @@ class OBSController:
                     if name:
                         scenes.append(name)
                 return scenes
-            except:
+            except Exception as e:
+                self._drop_client_unless_answered(e)
                 return []
 
     def get_scene_sources(self, scene_name):
@@ -138,7 +151,8 @@ class OBSController:
                     except:
                         continue
                 return sources
-            except:
+            except Exception as e:
+                self._drop_client_unless_answered(e)
                 return []
 
     def set_source_visibility(self, scene_name, source_name, visible):
@@ -158,6 +172,7 @@ class OBSController:
                 )
                 return {"success": True}
             except Exception as e:
+                self._drop_client_unless_answered(e)
                 return {"success": False, "error": str(e)}
 
     def get_current_scene(self):
@@ -172,7 +187,8 @@ class OBSController:
                     if kl in ('currentprogramscenename', 'scenename') and v:
                         return str(v)
                 return None
-            except:
+            except Exception as e:
+                self._drop_client_unless_answered(e)
                 return None
 
     def set_current_scene(self, scene_name):
@@ -183,6 +199,7 @@ class OBSController:
                 self.client.set_current_program_scene(scene_name)
                 return {"success": True}
             except Exception as e:
+                self._drop_client_unless_answered(e)
                 return {"success": False, "error": str(e)}
 
     def get_transitions(self):
@@ -205,7 +222,8 @@ class OBSController:
                     elif kl == 'currentscenetransitionname' and v:
                         current = str(v)
                 return {"transitions": transitions, "current": current}
-            except:
+            except Exception as e:
+                self._drop_client_unless_answered(e)
                 return {"transitions": [], "current": None}
 
     def set_transition(self, transition_name, duration_ms=None):
@@ -219,6 +237,7 @@ class OBSController:
                     self.client.set_current_scene_transition_duration(int(duration_ms))
                 return {"success": True}
             except Exception as e:
+                self._drop_client_unless_answered(e)
                 return {"success": False, "error": str(e)}
 
     def execute_obs_event(self, item):

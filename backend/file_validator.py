@@ -233,10 +233,20 @@ def _issue(level, code, message):
     return {"level": level, "code": code, "message": message}
 
 
+def _webp_animation_canvas(filepath):
+    try:
+        with open(filepath, 'rb') as handle:
+            header = handle.read(30)
+    except OSError:
+        return 0, 0
+    if len(header) < 30 or header[0:4] != b'RIFF' or header[8:16] != b'WEBPVP8X' or (header[20] & 0x02) == 0:
+        return 0, 0
+    return 1 + int.from_bytes(header[24:27], 'little'), 1 + int.from_bytes(header[27:30], 'little')
+
+
 class FileValidator:
     def __init__(self):
         self.config = Config()
-        self._last_probe = None
 
     def is_video(self, filepath):
         ext = Path(filepath).suffix.lower()
@@ -272,11 +282,7 @@ class FileValidator:
                     self._reject(result, "unsupported_extension", "Unsupported file format")
 
         result["playability"] = self._derive_playability(result["issues"])
-        self._last_probe = (filepath, result["file_signature"], result)
         return result
-
-    def validate_file(self, filepath):
-        return self.probe(filepath)
 
     def _new_result(self, filepath):
         if self.is_video(filepath):
@@ -512,7 +518,7 @@ class FileValidator:
                 plan = "none"
             else:
                 plan = "remux"
-        elif native:
+        elif native and codec_name in PLAYABLE_VIDEO_CODECS:
             plan = "none"
         else:
             plan = "full"
@@ -721,6 +727,8 @@ class FileValidator:
 
         width = _safe_int(stream.get('width')) or 0
         height = _safe_int(stream.get('height')) or 0
+        if codec_name == 'webp' and (width <= 0 or height <= 0):
+            width, height = _webp_animation_canvas(filepath)
         result["width"] = width
         result["height"] = height
 
@@ -779,29 +787,3 @@ class FileValidator:
         if bitrate_kbps >= 1000:
             return f"{bitrate_kbps / 1000:.1f} Mbps"
         return f"{bitrate_kbps:.0f} kbps"
-
-    def get_file_size(self, filepath):
-        try:
-            return self._format_size(os.path.getsize(filepath))
-        except Exception:
-            return "Unknown"
-
-    def _probe_data(self, source):
-        if isinstance(source, dict):
-            return source
-        cached = self._last_probe
-        if cached and cached[0] == source and cached[1] == self._file_signature(source):
-            return cached[2]
-        return self.probe(source)
-
-    def get_codec_info(self, source):
-        data = self._probe_data(source)
-        if not isinstance(data, dict):
-            return "Unknown"
-        return data.get("format") or "Unknown"
-
-    def get_bitrate(self, source):
-        data = self._probe_data(source)
-        if not isinstance(data, dict):
-            return None
-        return data.get("bitrate")
