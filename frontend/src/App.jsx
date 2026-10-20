@@ -4525,6 +4525,7 @@ const App = () => {
                     <select
                       style={styles.settingSelect}
                       value={outputSettings.audioDeviceLabel || ''}
+                      title={outputSettings.audioDeviceLabel || 'System default'}
                       onChange={(e) => handleOutputSettingsChange('audioDeviceLabel', e.target.value)}
                     >
                       <option value="">System default</option>
@@ -5670,6 +5671,8 @@ const styles = {
   },
   settingSelect: {
     flex: 1,
+    minWidth: 0,
+    textOverflow: 'ellipsis',
     padding: '8px 12px',
     background: 'var(--bg-base)',
     border: '1px solid var(--stroke-strong)',
