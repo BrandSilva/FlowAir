@@ -10,7 +10,7 @@ Professional 24/7 broadcast playout for Windows. Build a playlist of videos and 
 - **Live playlist editing** — add, drag, duplicate, copy/paste, loop and cue items while on air without touching what is playing
 - **Event rows** — STOP events to hold the channel, notes for the operator, and OBS events to switch scenes or show/hide sources
 - **Full-screen output** on any connected display, with a selectable audio output device, plus a browser player for OBS or other computers on your network
-- **Live controls** — a vertical audio strip next to the On Air Preview: the output volume fader, always live, and a level meter of what goes to air. Only timeline scrubbing sits behind the **EDIT** safety lock
+- **Live controls** — a vertical audio strip next to the On Air Preview: the output volume fader, always live, and a level meter of what goes to air. Only timeline scrubbing sits behind the **EDIT TIMELINE** safety lock
 - **File checks** — missing or corrupt files are marked red and skipped before they go on air
 - **Plays almost any video** — AVI, MKV, TS, HEVC and other formats the player cannot open are converted to MP4 in the background, using the GPU when there is one
 - **Session recovery** — after a crash, a power cut or an unexpected restart of the playout engine, FlowAir offers to restore the last playlist
@@ -82,7 +82,7 @@ The update panel says when FlowAir last checked, and **Check now** looks for a n
 | Duplicate an item | Hold `Ctrl` and drag the row, or right-click > **Duplicate** |
 | Go on air | **PLAY** (`Space`) |
 | Jump to an item | Select it and press **NEXT** (`N`), or **CUE** it (`Enter`) and press Play |
-| Seek inside the clip on air | Turn on **EDIT** next to the remaining time, then drag or click the progress bar. The next start times move with it |
+| Seek inside the clip on air | Click **EDIT TIMELINE** next to the remaining time to unlock the progress bar, then drag or click it; the time you would jump to is shown under the bar. The next start times move with it |
 | Hold the channel | Right-click the playlist > **Insert STOP Event** |
 | Operator notes | Right-click > **Insert Note** (double-click a note to edit it) |
 | OBS automation | Connect in **Settings > OBS**, then right-click > **Insert OBS Event** |
